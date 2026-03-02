@@ -11,6 +11,8 @@ Endpoints:
   POST /core/modules/{id}/enable   — enable (start service)
   POST /core/modules/{id}/disable  — disable (stop service)
   POST /core/modules/{id}/uninstall
+
+  POST /v1/chat/completions        — tool-aware chat proxy (→ PicoClaw + module tools)
 """
 
 import json
@@ -86,6 +88,17 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         path = urlparse(self.path).path.rstrip("/")
+
+        # Tool-aware chat proxy
+        if path == "/v1/chat/completions":
+            try:
+                from orchestrator import chat_with_tools
+                result = chat_with_tools(data)
+                self.send_json(200, result)
+            except Exception as e:
+                log.error("chat_with_tools error: %s", e)
+                self.send_json(500, {"error": str(e)})
+            return
 
         # /core/modules/{id}/{action}
         parts = path.split("/")

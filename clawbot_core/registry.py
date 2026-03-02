@@ -64,6 +64,37 @@ def get_all_modules():
     return result
 
 
+def get_enabled_tools():
+    """
+    Return OpenAI-compatible tool schemas from all enabled installed modules
+    that declare 'tool_definitions' in their manifest.json.
+
+    Tool name format: "{module_id}__{tool_name}" (double underscore separator)
+    so the orchestrator can route tool_calls back to the correct module.
+    """
+    tools = []
+    for m in load_local_modules().values():
+        if not m.get("enabled"):
+            continue
+        for tdef in m.get("tool_definitions", []):
+            tool_name = tdef.get("name", "")
+            if not tool_name:
+                continue
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": f"{m['id']}__{tool_name}",
+                    "description": tdef.get("description", ""),
+                    "parameters": tdef.get("parameters", {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                    }),
+                },
+            })
+    return tools
+
+
 def _is_service_active(service_name):
     if not service_name:
         return False

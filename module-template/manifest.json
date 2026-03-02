@@ -6,9 +6,38 @@
   "description": "What does your module do?",
   "category": "integration",
   "ram_mb": 50,
+  "port": 8091,
   "api_prefix": "/v1/my-module/",
   "service": "clawbot-my-module.service",
-  "tools": [],
   "requires": [],
-  "repo": "https://github.com/yourname/clawbot-my-module"
+  "repo": "https://github.com/yourname/clawbot-my-module",
+  "tool_definitions": [
+    {
+      "name": "get_status",
+      "description": "Returns current status of the module",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "do_something",
+      "description": "Example tool with parameters",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "What to act on"
+          },
+          "value": {
+            "type": "number",
+            "description": "Numeric value to apply"
+          }
+        },
+        "required": ["target"]
+      }
+    }
+  ]
 }
