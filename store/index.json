@@ -1,0 +1,65 @@
+{
+  "version": "1.0.0",
+  "updated": "2026-03-02",
+  "modules": [
+    {
+      "id": "telegram",
+      "name": "Telegram Bot",
+      "category": "interface",
+      "description": "Bridge ClawbotOS AI to Telegram — send messages, get status, chat with your AI from anywhere.",
+      "version": "1.0.0",
+      "author": "Yumi Lab",
+      "official": true,
+      "ram_mb": 15,
+      "repo": "https://github.com/Yumi-Lab/clawbot",
+      "docs": "https://github.com/Yumi-Lab/clawbot#telegram-bot"
+    },
+    {
+      "id": "voice",
+      "name": "Voice I/O",
+      "category": "interface",
+      "description": "Offline speech recognition (Vosk) and text-to-speech (espeak-ng). Talk to your AI assistant.",
+      "version": "0.1.0",
+      "author": "Yumi Lab",
+      "official": true,
+      "coming_soon": true,
+      "ram_mb": 120,
+      "requires": ["audio"]
+    },
+    {
+      "id": "screen",
+      "name": "TouchScreen UI",
+      "category": "interface",
+      "description": "SmartPad animated persona interface with touch controls and voice interaction.",
+      "version": "0.1.0",
+      "author": "Yumi Lab",
+      "official": true,
+      "coming_soon": true,
+      "ram_mb": 150,
+      "requires": ["smartpad", "voice"]
+    },
+    {
+      "id": "camera",
+      "name": "Camera Vision",
+      "category": "sensors",
+      "description": "Add a camera to ClawbotOS — capture images and let the AI describe or analyze them.",
+      "version": "0.1.0",
+      "author": "Yumi Lab",
+      "official": true,
+      "coming_soon": true,
+      "ram_mb": 200,
+      "requires": ["camera_hardware"]
+    },
+    {
+      "id": "mqtt",
+      "name": "MQTT / Home Automation",
+      "category": "integration",
+      "description": "Connect ClawbotOS to your smart home via MQTT. Control devices through the AI.",
+      "version": "0.1.0",
+      "author": "Yumi Lab",
+      "official": true,
+      "coming_soon": true,
+      "ram_mb": 20
+    }
+  ]
+}

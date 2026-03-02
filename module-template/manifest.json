@@ -1,0 +1,14 @@
+{
+  "id": "my-module",
+  "name": "My Module",
+  "version": "1.0.0",
+  "author": "your-github-username",
+  "description": "What does your module do?",
+  "category": "integration",
+  "ram_mb": 50,
+  "api_prefix": "/v1/my-module/",
+  "service": "clawbot-my-module.service",
+  "tools": [],
+  "requires": [],
+  "repo": "https://github.com/yourname/clawbot-my-module"
+}

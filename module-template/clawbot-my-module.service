@@ -1,0 +1,14 @@
+[Unit]
+Description=ClawbotOS My Module
+After=network.target clawbot-core.service
+
+[Service]
+Type=simple
+User=pi
+ExecStart=/usr/bin/python3 /home/pi/.clawbot/modules/my-module/main.py
+Restart=on-failure
+RestartSec=5
+MemoryMax=100M
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=ClawbotOS Core — Module Registry & Middleware
+After=network.target picoclaw.service clawbot-status-api.service
+Wants=picoclaw.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/local/lib/clawbot-core
+ExecStart=/usr/bin/python3 /usr/local/lib/clawbot-core/main.py
+Restart=on-failure
+RestartSec=5
+MemoryMax=50M
+
+[Install]
+WantedBy=multi-user.target
