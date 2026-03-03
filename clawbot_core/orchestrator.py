@@ -12,13 +12,34 @@ import urllib.request
 
 from registry import get_enabled_tools, load_local_modules
 
-PICOCLAW_URL = "http://127.0.0.1:8080/v1/chat/completions"
+PICOCLAW_CONFIG = "/home/pi/.picoclaw/config.json"
 MODULES_DIR = "/home/pi/.clawbot/modules"
 MAX_TOOL_ROUNDS = 5
-PICOCLAW_TIMEOUT = 120
+LLM_TIMEOUT = 120
 TOOL_TIMEOUT = 10
 
 log = logging.getLogger(__name__)
+
+
+def _load_llm_config() -> tuple[str, str, str]:
+    """
+    Read base_url, api_key and model from picoclaw config.
+    Falls back to picoclaw local gateway if config is missing.
+    Returns (url, api_key, model).
+    """
+    try:
+        with open(PICOCLAW_CONFIG) as f:
+            cfg = json.load(f)
+        entry = cfg.get("model_list", [{}])[0]
+        base = entry.get("base_url", "").rstrip("/")
+        key = entry.get("api_key", "")
+        model = entry.get("model", "")
+        if base and key:
+            return f"{base}/chat/completions", key, model
+    except Exception:
+        pass
+    # Fallback: picoclaw local gateway
+    return "http://127.0.0.1:8080/v1/chat/completions", "", ""
 
 
 def chat_with_tools(request_body: dict) -> dict:
@@ -36,6 +57,12 @@ def chat_with_tools(request_body: dict) -> dict:
         body["tool_choice"] = "auto"
     # Tool loop requires non-streaming internally
     body["stream"] = False
+
+    # Use model from config if caller didn't specify one
+    _, _, default_model = _load_llm_config()
+    if not body.get("model") or body.get("model") == "default":
+        if default_model:
+            body["model"] = default_model
 
     for round_num in range(MAX_TOOL_ROUNDS):
         log.info("Tool loop round %d/%d", round_num + 1, MAX_TOOL_ROUNDS)
@@ -82,24 +109,31 @@ def chat_with_tools(request_body: dict) -> dict:
 
 
 def _call_picoclaw(body: dict) -> dict:
-    """POST request_body to PicoClaw and return parsed JSON response."""
-    data = json.dumps(body).encode()
-    req = urllib.request.Request(
-        PICOCLAW_URL,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    """POST request_body to the configured LLM API and return parsed JSON response."""
+    url, api_key, default_model = _load_llm_config()
+
+    # Ensure a model is set
+    payload = dict(body)
+    if not payload.get("model") or payload.get("model") == "default":
+        if default_model:
+            payload["model"] = default_model
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=PICOCLAW_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body_text = e.read().decode(errors="replace")
-        log.error("PicoClaw HTTP %d: %s", e.code, body_text)
-        return _error_response(f"PicoClaw error {e.code}: {body_text[:200]}")
+        log.error("LLM API HTTP %d: %s", e.code, body_text)
+        return _error_response(f"LLM API error {e.code}: {body_text[:200]}")
     except Exception as e:
-        log.error("PicoClaw unreachable: %s", e)
-        return _error_response(f"PicoClaw unreachable: {e}")
+        log.error("LLM API unreachable: %s", e)
+        return _error_response(f"LLM API unreachable: {e}")
 
 
 def _execute_tool(tool_name: str, arguments_raw: str) -> str:
