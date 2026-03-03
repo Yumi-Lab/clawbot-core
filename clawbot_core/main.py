@@ -60,6 +60,16 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/core/health":
             self.send_json(200, {"ok": True, "service": "clawbot-core"})
 
+        elif path == "/core/version":
+            import os
+            vf = os.path.join(os.path.dirname(__file__), "..", "VERSION")
+            try:
+                with open(vf) as f:
+                    ver = f.read().strip()
+            except Exception:
+                ver = "unknown"
+            self.send_json(200, {"version": ver})
+
         elif path == "/core/modules":
             try:
                 modules = get_all_modules()
@@ -93,8 +103,24 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/chat/completions":
             try:
                 from orchestrator import chat_with_tools
+                stream = data.get("stream", False)
                 result = chat_with_tools(data)
-                self.send_json(200, result)
+                if stream:
+                    # Wrap non-streaming response as SSE for clients expecting stream:true
+                    content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    sse = (
+                        f"data: {{\"choices\":[{{\"delta\":{{\"content\":{json.dumps(content)}}},\"index\":0}}]}}\n\n"
+                        f"data: [DONE]\n\n"
+                    ).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.send_header("Content-Length", str(len(sse)))
+                    self.end_headers()
+                    self.wfile.write(sse)
+                else:
+                    self.send_json(200, result)
             except Exception as e:
                 log.error("chat_with_tools error: %s", e)
                 self.send_json(500, {"error": str(e)})
