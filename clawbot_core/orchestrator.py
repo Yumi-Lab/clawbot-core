@@ -35,6 +35,10 @@ def _load_llm_config() -> tuple[str, str, str]:
         key = entry.get("api_key", "")
         model = entry.get("model", "")
         if base and key:
+            # Anthropic native API is not OpenAI-compatible (/messages vs /chat/completions).
+            # Route through PicoClaw (port 8080) which handles format translation.
+            if "anthropic.com" in base:
+                return "http://127.0.0.1:8080/v1/chat/completions", "", model
             return f"{base}/chat/completions", key, model
     except Exception:
         pass
