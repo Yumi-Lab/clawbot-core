@@ -8,6 +8,8 @@ Endpoints:
   GET  /core/modules               — list all modules (installed + store)
   GET  /core/modules/{id}          — module details
   POST /core/modules/{id}/install  — install from repo   body: {"repo": "https://..."}
+  GET  /core/updates               — list managed repos + update status (clawbot.cfg)
+  POST /core/updates/{name}/update — git pull + restart services for a managed repo
   POST /core/modules/{id}/enable   — enable (start service)
   POST /core/modules/{id}/disable  — disable (stop service)
   POST /core/modules/{id}/uninstall
@@ -23,6 +25,7 @@ from urllib.parse import urlparse
 
 from registry import get_all_modules, load_local_modules
 from installer import install, uninstall, enable, disable
+from update_manager import list_updates, do_update
 
 PORT = 8090
 
@@ -85,6 +88,12 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_json(404, {"error": f"Module '{module_id}' not found"})
 
+        elif path == "/core/updates":
+            try:
+                self.send_json(200, {"updates": list_updates()})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -124,6 +133,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 log.error("chat_with_tools error: %s", e)
                 self.send_json(500, {"error": str(e)})
+            return
+
+        # /core/updates/{name}/update
+        if path.startswith("/core/updates/") and path.endswith("/update"):
+            name = path[len("/core/updates/"):-len("/update")]
+            ok, msg = do_update(name)
+            self.send_json(200 if ok else 500, {"ok": ok, "message": msg})
             return
 
         # /core/modules/{id}/{action}
