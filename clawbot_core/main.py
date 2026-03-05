@@ -134,8 +134,12 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/core/workspace":
             workspace = "/home/pi/.picoclaw/workspace"
             try:
-                files = [f for f in os.listdir(workspace) if os.path.isfile(os.path.join(workspace, f))]
-                self.send_json(200, {"files": sorted(files)})
+                entries = []
+                for f in sorted(os.listdir(workspace)):
+                    fp = os.path.join(workspace, f)
+                    if os.path.isfile(fp):
+                        entries.append({"name": f, "size": os.path.getsize(fp)})
+                self.send_json(200, {"files": entries})
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
 
@@ -340,6 +344,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "invalid id"})
                 return
             fpath = os.path.join(SESSIONS_DIR, sid + ".json")
+            if os.path.isfile(fpath):
+                os.remove(fpath)
+            self.send_json(200, {"ok": True})
+        elif path.startswith("/core/workspace/"):
+            from urllib.parse import unquote
+            filename = unquote(path[len("/core/workspace/"):])
+            if ".." in filename or "/" in filename:
+                self.send_json(400, {"error": "invalid filename"})
+                return
+            fpath = os.path.join("/home/pi/.picoclaw/workspace", filename)
             if os.path.isfile(fpath):
                 os.remove(fpath)
             self.send_json(200, {"ok": True})
