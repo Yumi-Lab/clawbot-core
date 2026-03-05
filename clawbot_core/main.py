@@ -264,13 +264,24 @@ class Handler(BaseHTTPRequestHandler):
                     capture_output=True, text=True, timeout=120,
                     env=env,
                 )
-                # Filter out log lines (timestamp pattern), keep the actual response
-                log_pattern = re.compile(r"^\d{4}/\d{2}/\d{2} ")
-                lines = (proc.stdout + proc.stderr).splitlines()
-                response_lines = [l for l in lines if not log_pattern.match(l) and l.strip()]
-                # picoclaw prepends 🦀 — strip it
-                response = "\n".join(response_lines).strip()
-                response = re.sub(r"^🦀\s*", "", response)
+                # Extract the clean final response using picoclaw's metadata.
+                # Output format: [log lines] 🦀 <response> [tool traces] {agent_id=... final_length=N}
+                raw = (proc.stdout + proc.stderr).encode("utf-8", errors="replace")
+                meta = re.search(rb"\{[^}]*final_length=(\d+)[^}]*\}", raw)
+                crab = raw.find("🦀".encode())
+                if meta and crab >= 0:
+                    final_len = int(meta.group(1))
+                    start = crab + len("🦀".encode())
+                    while start < len(raw) and raw[start:start+1] in (b" ", b"\n", b"\r"):
+                        start += 1
+                    response = raw[start:start + final_len].decode("utf-8", errors="replace").strip()
+                else:
+                    # Fallback: filter log lines and strip 🦀 prefix
+                    log_pattern = re.compile(r"^\d{4}/\d{2}/\d{2} ")
+                    lines = (proc.stdout + proc.stderr).splitlines()
+                    response_lines = [l for l in lines if not log_pattern.match(l) and l.strip()]
+                    response = "\n".join(response_lines).strip()
+                    response = re.sub(r"^🦀\s*", "", response)
                 if not response:
                     response = "(no response)"
                 content = json.dumps(response)
