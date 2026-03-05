@@ -19,6 +19,8 @@ Endpoints:
 
 import json
 import logging
+import re
+import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
@@ -132,6 +134,49 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(200, result)
             except Exception as e:
                 log.error("chat_with_tools error: %s", e)
+                self.send_json(500, {"error": str(e)})
+            return
+
+        # Picoclaw native agent (14 built-in tools)
+        if path == "/v1/picoclaw-agent":
+            messages = data.get("messages", [])
+            msg = next(
+                (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"),
+                ""
+            )
+            if not msg:
+                self.send_json(400, {"error": "no user message"})
+                return
+            try:
+                proc = subprocess.run(
+                    ["/usr/local/bin/picoclaw", "agent", "--message", msg],
+                    capture_output=True, text=True, timeout=120
+                )
+                # Filter out log lines (timestamp pattern), keep the actual response
+                log_pattern = re.compile(r"^\d{4}/\d{2}/\d{2} ")
+                lines = (proc.stdout + proc.stderr).splitlines()
+                response_lines = [l for l in lines if not log_pattern.match(l) and l.strip()]
+                # picoclaw prepends 🦀 — strip it
+                response = "\n".join(response_lines).strip()
+                response = re.sub(r"^🦀\s*", "", response)
+                if not response:
+                    response = "(no response)"
+                content = json.dumps(response)
+                sse = (
+                    f"data: {{\"choices\":[{{\"delta\":{{\"content\":{content}}},\"index\":0}}]}}\n\n"
+                    f"data: [DONE]\n\n"
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", str(len(sse)))
+                self.end_headers()
+                self.wfile.write(sse)
+            except subprocess.TimeoutExpired:
+                self.send_json(504, {"error": "picoclaw agent timed out"})
+            except Exception as e:
+                log.error("picoclaw-agent error: %s", e)
                 self.send_json(500, {"error": str(e)})
             return
 
