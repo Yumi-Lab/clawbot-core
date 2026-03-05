@@ -96,6 +96,39 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
 
+        elif path.startswith("/core/workspace/"):
+            import os, mimetypes
+            filename = path[len("/core/workspace/"):]
+            # Prevent directory traversal
+            if ".." in filename or filename.startswith("/"):
+                self.send_json(400, {"error": "invalid filename"})
+                return
+            workspace = "/home/pi/.picoclaw/workspace"
+            filepath = os.path.join(workspace, filename)
+            if not os.path.isfile(filepath):
+                self.send_json(404, {"error": "file not found"})
+                return
+            mime, _ = mimetypes.guess_type(filepath)
+            mime = mime or "application/octet-stream"
+            with open(filepath, "rb") as f:
+                data = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(data)
+
+        elif path == "/core/workspace":
+            import os
+            workspace = "/home/pi/.picoclaw/workspace"
+            try:
+                files = [f for f in os.listdir(workspace) if os.path.isfile(os.path.join(workspace, f))]
+                self.send_json(200, {"files": sorted(files)})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
         else:
             self.send_json(404, {"error": "not found"})
 
