@@ -14,16 +14,28 @@ Endpoints:
   POST /core/modules/{id}/disable  — disable (stop service)
   POST /core/modules/{id}/uninstall
 
+  GET  /core/sessions              — list chat sessions
+  GET  /core/sessions/{id}         — get session (messages + metadata)
+  POST /core/sessions/{id}         — create/update session  body: {name, mode, messages}
+  DELETE /core/sessions/{id}       — delete session
+
+  GET  /core/workspace             — list workspace files
+  GET  /core/workspace/{file}      — download workspace file
+
   POST /v1/chat/completions        — tool-aware chat proxy (→ PicoClaw + module tools)
 """
 
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
+
+SESSIONS_DIR = "/home/pi/.clawbot/sessions"
 
 from registry import get_all_modules, load_local_modules
 from installer import install, uninstall, enable, disable
@@ -66,7 +78,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"ok": True, "service": "clawbot-core"})
 
         elif path == "/core/version":
-            import os
             vf = os.path.join(os.path.dirname(__file__), "..", "VERSION")
             try:
                 with open(vf) as f:
@@ -97,7 +108,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(500, {"error": str(e)})
 
         elif path.startswith("/core/workspace/"):
-            import os, mimetypes
+            import mimetypes
             filename = path[len("/core/workspace/"):]
             # Prevent directory traversal
             if ".." in filename or filename.startswith("/"):
@@ -121,11 +132,43 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
         elif path == "/core/workspace":
-            import os
             workspace = "/home/pi/.picoclaw/workspace"
             try:
                 files = [f for f in os.listdir(workspace) if os.path.isfile(os.path.join(workspace, f))]
                 self.send_json(200, {"files": sorted(files)})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path == "/core/sessions":
+            try:
+                os.makedirs(SESSIONS_DIR, exist_ok=True)
+                sessions = []
+                for fname in sorted(os.listdir(SESSIONS_DIR)):
+                    if not fname.endswith(".json"):
+                        continue
+                    try:
+                        with open(os.path.join(SESSIONS_DIR, fname)) as f:
+                            s = json.load(f)
+                        sessions.append({k: s[k] for k in ("id","name","mode","createdAt","updatedAt") if k in s})
+                    except Exception:
+                        pass
+                sessions.sort(key=lambda s: s.get("updatedAt", 0), reverse=True)
+                self.send_json(200, {"sessions": sessions})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path.startswith("/core/sessions/"):
+            sid = path[len("/core/sessions/"):]
+            if ".." in sid or "/" in sid:
+                self.send_json(400, {"error": "invalid id"})
+                return
+            fpath = os.path.join(SESSIONS_DIR, sid + ".json")
+            if not os.path.isfile(fpath):
+                self.send_json(404, {"error": "session not found"})
+                return
+            try:
+                with open(fpath) as f:
+                    self.send_json(200, json.load(f))
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
 
@@ -142,6 +185,35 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         path = urlparse(self.path).path.rstrip("/")
+
+        # Session create/update
+        if path.startswith("/core/sessions/"):
+            sid = path[len("/core/sessions/"):]
+            if ".." in sid or "/" in sid:
+                self.send_json(400, {"error": "invalid id"})
+                return
+            os.makedirs(SESSIONS_DIR, exist_ok=True)
+            fpath = os.path.join(SESSIONS_DIR, sid + ".json")
+            now = int(time.time() * 1000)
+            existing = {}
+            if os.path.isfile(fpath):
+                try:
+                    with open(fpath) as f:
+                        existing = json.load(f)
+                except Exception:
+                    pass
+            existing.update({
+                "id": sid,
+                "name": data.get("name", existing.get("name", "New chat")),
+                "mode": data.get("mode", existing.get("mode", "core")),
+                "messages": data.get("messages", existing.get("messages", [])),
+                "createdAt": existing.get("createdAt", now),
+                "updatedAt": now,
+            })
+            with open(fpath, "w") as f:
+                json.dump(existing, f)
+            self.send_json(200, {"ok": True})
+            return
 
         # Tool-aware chat proxy
         if path == "/v1/chat/completions":
@@ -181,8 +253,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "no user message"})
                 return
             try:
-                import os as _os
-                env = _os.environ.copy()
+                env = os.environ.copy()
                 env["HOME"] = "/home/pi"
                 proc = subprocess.run(
                     ["/usr/local/bin/picoclaw", "agent", "--message", msg],
@@ -257,6 +328,21 @@ class Handler(BaseHTTPRequestHandler):
 
             else:
                 self.send_json(404, {"error": f"Unknown action '{action}'"})
+        else:
+            self.send_json(404, {"error": "not found"})
+
+
+    def do_DELETE(self):
+        path = urlparse(self.path).path.rstrip("/")
+        if path.startswith("/core/sessions/"):
+            sid = path[len("/core/sessions/"):]
+            if ".." in sid or "/" in sid:
+                self.send_json(400, {"error": "invalid id"})
+                return
+            fpath = os.path.join(SESSIONS_DIR, sid + ".json")
+            if os.path.isfile(fpath):
+                os.remove(fpath)
+            self.send_json(200, {"ok": True})
         else:
             self.send_json(404, {"error": "not found"})
 
