@@ -257,6 +257,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "no user message"})
                 return
             try:
+                verbose = data.get("verbose", False)
                 env = os.environ.copy()
                 env["HOME"] = "/home/pi"
                 proc = subprocess.run(
@@ -264,24 +265,55 @@ class Handler(BaseHTTPRequestHandler):
                     capture_output=True, text=True, timeout=120,
                     env=env,
                 )
-                # Extract the clean final response using picoclaw's metadata.
-                # Output format: [log lines] 🦀 <response> [tool traces] {agent_id=... final_length=N}
+                # Always parse: extract clean final response + full trace
                 raw = (proc.stdout + proc.stderr).encode("utf-8", errors="replace")
                 meta = re.search(rb"\{[^}]*final_length=(\d+)[^}]*\}", raw)
                 crab = raw.find("🦀".encode())
+
                 if meta and crab >= 0:
                     final_len = int(meta.group(1))
                     start = crab + len("🦀".encode())
                     while start < len(raw) and raw[start:start+1] in (b" ", b"\n", b"\r"):
                         start += 1
-                    response = raw[start:start + final_len].decode("utf-8", errors="replace").strip()
+                    clean = raw[start:start + final_len].decode("utf-8", errors="replace").strip()
+                    # Trace = everything between 🦀 and stats line (non-log)
+                    meta_start = raw.find(meta.group(0))
+                    trace_raw = raw[crab:meta_start].decode("utf-8", errors="replace")
                 else:
-                    # Fallback: filter log lines and strip 🦀 prefix
-                    log_pattern = re.compile(r"^\d{4}/\d{2}/\d{2} ")
+                    log_pat = re.compile(r"^\d{4}/\d{2}/\d{2} ")
                     lines = (proc.stdout + proc.stderr).splitlines()
-                    response_lines = [l for l in lines if not log_pattern.match(l) and l.strip()]
-                    response = "\n".join(response_lines).strip()
-                    response = re.sub(r"^🦀\s*", "", response)
+                    resp_lines = [l for l in lines if not log_pat.match(l) and l.strip()]
+                    clean = re.sub(r"^🦀\s*", "", "\n".join(resp_lines).strip())
+                    trace_raw = "\n".join(resp_lines)
+
+                # Build trace with section markers
+                trace_lines = trace_raw.splitlines()
+                trace_sections, current = [], []
+                for line in trace_lines:
+                    if re.match(r"^\s*(#|import |from |def |class |>>>|===|---)", line):
+                        if current:
+                            trace_sections.append("\n".join(current))
+                            current = []
+                    current.append(line)
+                if current:
+                    trace_sections.append("\n".join(current))
+
+                # Build final response: final answer + (in verbose) trace blocks
+                if verbose and len(trace_sections) > 1:
+                    parts = []
+                    for i, sec in enumerate(trace_sections):
+                        sec = sec.strip()
+                        if not sec:
+                            continue
+                        # First section is the final response text (already in clean)
+                        if i == 0:
+                            parts.append(sec)
+                        else:
+                            parts.append(f"\n\n---\n**[Trace — step {i}]**\n```\n{sec}\n```")
+                    response = "\n".join(parts)
+                else:
+                    response = clean
+
                 if not response:
                     response = "(no response)"
                 content = json.dumps(response)
