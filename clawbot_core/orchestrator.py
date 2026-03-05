@@ -31,7 +31,7 @@ def _load_llm_config() -> tuple[str, str, str]:
         with open(PICOCLAW_CONFIG) as f:
             cfg = json.load(f)
         entry = cfg.get("model_list", [{}])[0]
-        base = entry.get("base_url", "").rstrip("/")
+        base = entry.get("api_base", entry.get("base_url", "")).rstrip("/")
         key = entry.get("api_key", "")
         model = entry.get("model", "")
         if base and key:

@@ -148,9 +148,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "no user message"})
                 return
             try:
+                import os as _os
+                env = _os.environ.copy()
+                env["HOME"] = "/home/pi"
                 proc = subprocess.run(
                     ["/usr/local/bin/picoclaw", "agent", "--message", msg],
-                    capture_output=True, text=True, timeout=120
+                    capture_output=True, text=True, timeout=120,
+                    env=env,
                 )
                 # Filter out log lines (timestamp pattern), keep the actual response
                 log_pattern = re.compile(r"^\d{4}/\d{2}/\d{2} ")
