@@ -17,8 +17,9 @@ from registry import get_enabled_tools, load_local_modules
 
 PICOCLAW_CONFIG = "/home/pi/.picoclaw/config.json"
 MODULES_DIR = "/home/pi/.clawbot/modules"
-MAX_TOOL_ROUNDS = 8
-LLM_TIMEOUT = 120
+AGENTS_DIR = "/home/pi/.clawbot/agents"
+MAX_TOOL_ROUNDS = 15
+LLM_TIMEOUT = 240
 TOOL_TIMEOUT = 10
 TOOL_RESULT_MAX_CHARS = 6000   # truncate tool output beyond this to save tokens
 
@@ -99,6 +100,21 @@ BUILTIN_TOOLS = [
                     "timeout": {"type": "integer", "description": "Timeout in seconds (default 30)", "default": 30},
                 },
                 "required": ["host", "user", "password", "command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "system__web_search",
+            "description": "Search the web using DuckDuckGo and return the top results with titles, URLs, and snippets. Use this to find current information, documentation, tutorials, or answers to questions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query"},
+                    "max_results": {"type": "integer", "description": "Maximum number of results to return (default 5, max 10)", "default": 5},
+                },
+                "required": ["query"],
             },
         },
     },
@@ -197,14 +213,18 @@ def _compact_messages(messages: list) -> list:
     return compacted
 
 
-def chat_with_tools(request_body: dict) -> dict:
+def chat_with_tools(request_body: dict, override_tools: list = None) -> dict:
     """
     Main orchestration loop.
     Injects available tools, calls PicoClaw, executes tool_calls, loops.
     Returns final OpenAI-compatible response dict.
+    override_tools: if set, use these instead of auto-discovered tools.
     """
-    module_tools = get_enabled_tools()
-    tools = BUILTIN_TOOLS + module_tools  # system tools always available
+    if override_tools is not None:
+        tools = override_tools
+    else:
+        module_tools = get_enabled_tools()
+        tools = BUILTIN_TOOLS + module_tools
 
     # Work on a copy to avoid mutating caller's data
     body = dict(request_body)
@@ -311,7 +331,7 @@ def chat_with_tools(request_body: dict) -> dict:
     return _call_picoclaw(body)
 
 
-def chat_with_tools_stream(request_body: dict):
+def chat_with_tools_stream(request_body: dict, override_tools: list = None):
     """
     Generator variant of chat_with_tools for real-time SSE streaming.
     Yields dicts: {"type": "tool_call"|"tool_result"|"done"|"error", ...}
@@ -320,8 +340,11 @@ def chat_with_tools_stream(request_body: dict):
     done: {"type":"done","content":"final text"}
     error: {"type":"error","message":"..."}
     """
-    module_tools = get_enabled_tools()
-    tools = BUILTIN_TOOLS + module_tools
+    if override_tools is not None:
+        tools = override_tools
+    else:
+        module_tools = get_enabled_tools()
+        tools = BUILTIN_TOOLS + module_tools
 
     body = dict(request_body)
     if tools:
@@ -355,11 +378,19 @@ def chat_with_tools_stream(request_body: dict):
         if default_model:
             body["model"] = default_model
 
+    model_name = body.get("model", "Claude")
+
     for round_num in range(MAX_TOOL_ROUNDS):
         estimated = _estimate_tokens(body["messages"])
         if estimated > COMPACT_THRESHOLD:
+            yield {"type": "thinking", "message": f"Compacting context (~{estimated // 1000}k tokens)..."}
             log.info("Context too large (~%d tokens), auto-compacting...", estimated)
             body["messages"] = _compact_messages(body["messages"])
+
+        if round_num == 0:
+            yield {"type": "thinking", "message": f"Calling {model_name}..."}
+        else:
+            yield {"type": "thinking", "message": f"Analyzing results — round {round_num + 1}/{MAX_TOOL_ROUNDS}"}
 
         log.info("Tool loop round %d/%d (stream)", round_num + 1, MAX_TOOL_ROUNDS)
         response = _call_picoclaw(body)
@@ -398,6 +429,10 @@ def chat_with_tools_stream(request_body: dict):
         yield {"type": "tool_call", "round": round_num + 1, "calls": calls_info}
 
         body["messages"].append(choice["message"])
+
+        # Emit thinking for tool execution
+        tool_names_str = ", ".join(c["name"].replace("system__", "") for c in calls_info)
+        yield {"type": "thinking", "message": f"Executing {tool_names_str}..."}
 
         # Execute tools (parallel if multiple)
         def _run_tc_stream(tc):
@@ -439,6 +474,7 @@ def chat_with_tools_stream(request_body: dict):
         yield {"type": "tool_result", "round": round_num + 1, "results": results_list}
 
     # Safety fallback after max rounds
+    yield {"type": "thinking", "message": "Preparing final response..."}
     body.pop("tools", None)
     body.pop("tool_choice", None)
     response = _call_picoclaw(body)
@@ -563,6 +599,16 @@ def _execute_builtin(tool_suffix: str, arguments: dict) -> str:
         except Exception as e:
             return f"[error] {e}"
 
+    if tool_suffix == "web_search":
+        query = arguments.get("query", "")
+        if not query:
+            return "[error] No query provided"
+        max_results = min(int(arguments.get("max_results", 5)), 10)
+        try:
+            return _web_search(query, max_results)
+        except Exception as e:
+            return f"[error] Web search failed: {e}"
+
     if tool_suffix == "ssh":
         import shutil
         host = arguments.get("host", "")
@@ -592,6 +638,51 @@ def _execute_builtin(tool_suffix: str, arguments: dict) -> str:
             return f"[error] {e}"
 
     return f"[error] Unknown built-in tool: system__{tool_suffix}"
+
+
+def _web_search(query: str, max_results: int = 5) -> str:
+    """Search DuckDuckGo HTML and extract results. Pure stdlib, no pip."""
+    import html as html_mod
+    import re
+
+    encoded = urllib.request.quote(query)
+    url = f"https://html.duckduckgo.com/html/?q={encoded}"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (X11; Linux armv7l) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    })
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+
+    results = []
+    # DuckDuckGo HTML results are in <a class="result__a" ...> blocks
+    # and snippets in <a class="result__snippet" ...> blocks
+    links = re.findall(
+        r'<a\s+rel="nofollow"\s+class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
+        body, re.DOTALL,
+    )
+    snippets = re.findall(
+        r'<a\s+class="result__snippet"[^>]*>(.*?)</a>',
+        body, re.DOTALL,
+    )
+
+    for i, (href, title_html) in enumerate(links[:max_results]):
+        title = re.sub(r"<[^>]+>", "", title_html).strip()
+        title = html_mod.unescape(title)
+        snippet = ""
+        if i < len(snippets):
+            snippet = re.sub(r"<[^>]+>", "", snippets[i]).strip()
+            snippet = html_mod.unescape(snippet)
+        # DuckDuckGo wraps URLs in a redirect; extract the real URL
+        real_url = href
+        if "uddg=" in href:
+            match = re.search(r"uddg=([^&]+)", href)
+            if match:
+                real_url = urllib.request.unquote(match.group(1))
+        results.append(f"{i+1}. {title}\n   {real_url}\n   {snippet}")
+
+    if not results:
+        return f"No results found for: {query}"
+    return f"Search results for: {query}\n\n" + "\n\n".join(results)
 
 
 def _execute_tool(tool_name: str, arguments_raw: str) -> str:
@@ -672,3 +763,313 @@ def _error_response(message: str) -> dict:
         }],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Sub-Agent System — configurable personas with skills, routing & parallel exec
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_DEFAULT_AGENTS = [
+    {
+        "id": "python-dev",
+        "name": "Python Dev",
+        "avatar": "\U0001f40d",
+        "color": "#3776ab",
+        "system_prompt": (
+            "You are an expert Python developer running on ClawbotOS (Raspberry Pi, AllWinner H3). "
+            "Write clean, efficient Python code. Use stdlib when possible (no pip on this device). "
+            "Always execute code with your tools — never just describe what to do. Be concise."
+        ),
+        "skills": ["system__python", "system__bash", "system__write_file", "system__read_file"],
+        "keywords": ["python", "script", "code", "function", "class", "debug", "pip", "module", "import", "def",
+                     "programme", "coder", "variable", "boucle", "erreur"],
+        "enabled": True,
+    },
+    {
+        "id": "sysadmin",
+        "name": "SysAdmin",
+        "avatar": "\U0001f527",
+        "color": "#e74c3c",
+        "system_prompt": (
+            "You are a Linux system administrator expert on ClawbotOS (Raspberry Pi, AllWinner H3, Armbian). "
+            "You manage services, network, storage, security. Interface: end0 (Ethernet), wlx* (WiFi USB). "
+            "Use `ip addr` not `ifconfig`. CPU temp: `cat /sys/class/thermal/thermal_zone0/temp` / 1000. "
+            "Be concise and action-oriented."
+        ),
+        "skills": ["system__bash", "system__read_file", "system__write_file", "system__ssh"],
+        "keywords": ["system", "service", "network", "disk", "memory", "cpu", "process", "linux", "server",
+                     "ssh", "firewall", "log", "systemctl", "apt", "admin", "config", "daemon",
+                     "serveur", "connecter", "connexion", "reseau", "disque", "memoire", "processus",
+                     "utilisateur", "permission", "droit", "port", "ip", "adresse",
+                     "fichier", "dossier", "remote", "distant", "mot de passe", "password", "root"],
+        "enabled": True,
+    },
+    {
+        "id": "web-researcher",
+        "name": "Web Researcher",
+        "avatar": "\U0001f310",
+        "color": "#2ecc71",
+        "system_prompt": (
+            "You are a web research specialist. Search the internet to find accurate, up-to-date information. "
+            "Summarize findings clearly with sources. Cross-reference multiple results for accuracy. "
+            "Always use your web_search tool to answer questions."
+        ),
+        "skills": ["system__web_search", "system__bash"],
+        "keywords": ["search", "find", "research", "google", "web", "internet", "look up", "information",
+                     "what is", "who is", "how to", "documentation", "tutorial",
+                     "chercher", "rechercher", "trouver", "internet", "c'est quoi", "qu'est-ce que",
+                     "comment", "documentation", "info"],
+        "enabled": True,
+    },
+    {
+        "id": "file-manager",
+        "name": "File Manager",
+        "avatar": "\U0001f4c1",
+        "color": "#f39c12",
+        "system_prompt": (
+            "You are a file management specialist on ClawbotOS. You organize, read, write, and manage files "
+            "efficiently. You can create scripts, config files, and documentation. "
+            "Always show file contents or confirmation after operations."
+        ),
+        "skills": ["system__read_file", "system__write_file", "system__bash"],
+        "keywords": ["file", "folder", "directory", "create", "write", "read", "edit", "move", "copy",
+                     "delete", "config", "json", "yaml", "txt", "save",
+                     "fichier", "dossier", "repertoire", "creer", "ecrire", "lire", "modifier",
+                     "copier", "supprimer", "sauvegarder"],
+        "enabled": True,
+    },
+]
+
+
+def _init_default_agents():
+    """Create default agents if agents directory is empty."""
+    os.makedirs(AGENTS_DIR, exist_ok=True)
+    if any(f.endswith(".json") for f in os.listdir(AGENTS_DIR)):
+        return
+    for agent in _DEFAULT_AGENTS:
+        with open(os.path.join(AGENTS_DIR, agent["id"] + ".json"), "w") as f:
+            json.dump(agent, f, indent=2)
+    log.info("Created %d default agents", len(_DEFAULT_AGENTS))
+
+
+def load_agents() -> dict:
+    """Load all agent configurations from AGENTS_DIR."""
+    _init_default_agents()
+    agents = {}
+    try:
+        for fname in sorted(os.listdir(AGENTS_DIR)):
+            if not fname.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(AGENTS_DIR, fname)) as f:
+                    agent = json.load(f)
+                agents[agent["id"]] = agent
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return agents
+
+
+def save_agent(agent: dict) -> None:
+    """Save agent config to disk."""
+    os.makedirs(AGENTS_DIR, exist_ok=True)
+    with open(os.path.join(AGENTS_DIR, agent["id"] + ".json"), "w") as f:
+        json.dump(agent, f, indent=2)
+
+
+def delete_agent(agent_id: str) -> bool:
+    """Delete agent config from disk."""
+    path = os.path.join(AGENTS_DIR, agent_id + ".json")
+    if os.path.isfile(path):
+        os.remove(path)
+        return True
+    return False
+
+
+def _route_via_llm(user_message: str, agents: dict) -> str | None:
+    """Call Haiku to classify which agent should handle the message.
+    Returns agent id or None if no match / error.
+    """
+    enabled = {k: v for k, v in agents.items() if v.get("enabled", True)}
+    if not enabled:
+        return None
+
+    # Build concise agent descriptions for the classifier
+    descs = []
+    for a in enabled.values():
+        skills = ", ".join(a.get("skills", []))
+        # Truncate system_prompt to keep the classification prompt small
+        desc = (a.get("system_prompt") or "")[:200]
+        descs.append(f"- id: {a['id']} | name: {a['name']} | skills: {skills} | role: {desc}")
+
+    prompt = (
+        "Tu es un routeur intelligent. Analyse le message utilisateur et choisis l'agent le plus adapté.\n\n"
+        "Agents disponibles:\n" + "\n".join(descs) + "\n\n"
+        f"Message utilisateur: \"{user_message}\"\n\n"
+        "Réponds UNIQUEMENT avec l'id de l'agent le plus adapté (ex: sysadmin). "
+        "Si aucun agent ne correspond, réponds: none"
+    )
+
+    url, api_key, _ = _load_llm_config()
+    body = {
+        "model": "claude-haiku-4-5-20251001",
+        "stream": False,
+        "max_tokens": 30,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        chosen = data["choices"][0]["message"]["content"].strip().lower()
+        # Clean up: Haiku may add quotes or extra text
+        chosen = chosen.strip('"\'`.').split()[0] if chosen else ""
+        log.info("LLM router chose agent: '%s'", chosen)
+        if chosen and chosen != "none" and chosen in enabled:
+            return chosen
+    except Exception as e:
+        log.warning("LLM routing failed: %s", e)
+    return None
+
+
+def _route_via_keywords(user_message: str, agents: dict) -> list:
+    """Fallback: match user message to agents based on keywords.
+    Returns list of agent configs sorted by relevance (highest score first).
+    """
+    msg_lower = user_message.lower()
+    scored = []
+    for agent in agents.values():
+        if not agent.get("enabled", True):
+            continue
+        score = 0
+        for kw in agent.get("keywords", []):
+            if kw.lower() in msg_lower:
+                score += 1
+        if score > 0:
+            scored.append((score, agent))
+    scored.sort(key=lambda x: -x[0])
+    return [a for _, a in scored]
+
+
+def route_to_agents(user_message: str, agents: dict = None) -> list:
+    """Route user message to the best agent using LLM classification (Haiku).
+    Falls back to keyword matching if LLM call fails.
+    Returns list of agent configs sorted by relevance.
+    """
+    if agents is None:
+        agents = load_agents()
+
+    # Primary: LLM-based routing via Haiku
+    chosen_id = _route_via_llm(user_message, agents)
+    if chosen_id:
+        return [agents[chosen_id]]
+
+    # Fallback: keyword-based routing
+    log.info("LLM routing returned no match, trying keyword fallback")
+    return _route_via_keywords(user_message, agents)
+
+
+def _build_agent_tools(agent_config: dict) -> list:
+    """Build tool list filtered to agent's skills."""
+    agent_skills = set(agent_config.get("skills", []))
+    all_tools = BUILTIN_TOOLS + get_enabled_tools()
+    if not agent_skills:
+        return all_tools
+    return [t for t in all_tools if t["function"]["name"] in agent_skills]
+
+
+def chat_with_agent_stream(request_body: dict, agent_id: str):
+    """
+    Stream chat using a specific agent's persona and filtered tools.
+    Yields same events as chat_with_tools_stream plus agent_id in each event.
+    """
+    agents = load_agents()
+    agent = agents.get(agent_id)
+    if not agent:
+        yield {"type": "error", "message": f"Agent '{agent_id}' not found", "agent_id": agent_id}
+        return
+
+    tools = _build_agent_tools(agent)
+    tool_names = ", ".join(t["function"]["name"] for t in tools if t.get("type") == "function")
+    system_prompt = (
+        f"{agent.get('system_prompt', 'You are a helpful assistant.')}\n\n"
+        f"You have access to the following tools: {tool_names}. "
+        "ALWAYS use your tools to complete tasks — never just describe how to do something. "
+        "Execute commands, write files, and run code directly."
+    )
+
+    body = dict(request_body)
+    messages = [m for m in body.get("messages", []) if m.get("role") != "system"]
+    body["messages"] = [{"role": "system", "content": system_prompt}] + messages
+
+    agent_name = agent.get("name", agent_id)
+    yield {"type": "thinking", "message": f"Agent {agent_name} initializing...", "agent_id": agent_id}
+
+    for event in chat_with_tools_stream(body, override_tools=tools):
+        event["agent_id"] = agent_id
+        yield event
+
+
+def chat_with_multi_agents_stream(request_body: dict, agent_ids: list):
+    """
+    Run multiple agents in parallel. Yields events tagged with agent_id.
+    First yields an agent_start event with all participating agents.
+    """
+    import queue
+    import threading
+
+    agents = load_agents()
+    participating = []
+    for aid in agent_ids:
+        if aid in agents and agents[aid].get("enabled", True):
+            a = agents[aid]
+            participating.append({
+                "id": a["id"], "name": a["name"],
+                "avatar": a.get("avatar", "\U0001f916"),
+                "color": a.get("color", "#00ffe0"),
+            })
+
+    if not participating:
+        yield {"type": "error", "message": "No valid agents found"}
+        return
+
+    yield {"type": "agent_start", "agents": participating}
+
+    if len(participating) == 1:
+        yield from chat_with_agent_stream(request_body, participating[0]["id"])
+        return
+
+    # Parallel execution via threads
+    result_queue = queue.Queue()
+
+    def _run_agent(aid):
+        try:
+            for event in chat_with_agent_stream(request_body, aid):
+                result_queue.put(event)
+        except Exception as e:
+            result_queue.put({"type": "error", "message": str(e), "agent_id": aid})
+        result_queue.put({"type": "_agent_finished", "agent_id": aid})
+
+    threads = []
+    for p in participating:
+        t = threading.Thread(target=_run_agent, args=(p["id"],), daemon=True)
+        t.start()
+        threads.append(t)
+
+    finished_count = 0
+    while finished_count < len(participating):
+        try:
+            event = result_queue.get(timeout=LLM_TIMEOUT + 30)
+            if event.get("type") == "_agent_finished":
+                finished_count += 1
+                continue
+            yield event
+        except Exception:
+            break
+
+    yield {"type": "all_done"}
