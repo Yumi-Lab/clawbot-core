@@ -18,8 +18,32 @@ from registry import get_enabled_tools, load_local_modules
 PICOCLAW_CONFIG = "/home/pi/.picoclaw/config.json"
 MODULES_DIR = "/home/pi/.clawbot/modules"
 AGENTS_DIR = "/home/pi/.clawbot/agents"
-MAX_TOOL_ROUNDS = 15
-LLM_TIMEOUT = 240
+CORE_PROMPTS_PATH = "/home/pi/.clawbot/core-prompts.json"
+
+DEFAULT_SYSTEM_PROMPT = (
+    "You are ClawbotOS Core, an AI assistant running on a Raspberry Pi (AllWinner H3, armhf/arm64). "
+    "You have access to the following tools: {tools}. "
+    "ALWAYS use your tools to complete tasks — never just describe how to do something. "
+    "Execute commands, write files, and run code directly. "
+    "Be concise and action-oriented.\n"
+    "Hardware tips: CPU temp via `cat /sys/class/thermal/thermal_zone0/temp` (divide by 1000 for °C) — "
+    "vcgencmd is NOT available on AllWinner. "
+    "Network interface is end0 (Ethernet) or wlx* (WiFi USB), not eth0. "
+    "Use `ip addr` not `ifconfig`. "
+    "Prefer stdlib-only Python (no pip). "
+    "When a command fails, try an alternative instead of giving up."
+)
+
+
+def _load_core_prompts():
+    """Load editable system prompts from /home/pi/.clawbot/core-prompts.json."""
+    try:
+        with open(CORE_PROMPTS_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+MAX_TOOL_ROUNDS = 9999
+LLM_TIMEOUT = 900  # 15 min — Anthropic can take a long time for complex/long responses
 TOOL_TIMEOUT = 10
 TOOL_RESULT_MAX_CHARS = 6000   # truncate tool output beyond this to save tokens
 
@@ -118,6 +142,119 @@ BUILTIN_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "system__spawn_agents",
+            "description": (
+                "Run multiple sub-agents in parallel on independent tasks and collect their results. "
+                "Use when a complex request can be decomposed into independent subtasks handled by different specialists. "
+                "Each agent works autonomously — do NOT use for sequential tasks that depend on each other. "
+                "Returns the combined output of all agents."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tasks": {
+                        "type": "array",
+                        "description": "List of independent tasks to run in parallel",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "agent": {"type": "string", "description": "Agent ID to assign this task to"},
+                                "task": {"type": "string", "description": "Full task description for this agent — be specific and self-contained"},
+                            },
+                            "required": ["agent", "task"],
+                        },
+                    },
+                    "timeout": {"type": "integer", "description": "Max seconds to wait per agent (default 120)", "default": 120},
+                },
+                "required": ["tasks"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "system__handoff",
+            "description": (
+                "Transfer a specific sub-task to a specialist agent. Use ONLY when the task requires "
+                "expertise outside your specialization. Write a COMPACT, self-contained brief — "
+                "the target agent has NO access to the conversation history. "
+                "Rules: (1) context = only what the target agent strictly needs to know, as short as possible. "
+                "(2) task = precise actionable instruction. (3) expected_output = exact format you need back. "
+                "Do NOT use for tasks you can handle yourself."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": "string", "description": "ID of the target agent (e.g. 'julien', 'marc', 'sophie', 'thierry')"},
+                    "task": {"type": "string", "description": "Precise, actionable instruction — self-contained, no assumed context"},
+                    "context": {"type": "string", "description": "Minimal background the agent needs. Summarize only what is strictly necessary."},
+                    "expected_output": {"type": "string", "description": "Exact format or content you need back (e.g. 'the file content as text', 'a list of IPs', 'a working Python function')"},
+                },
+                "required": ["agent_id", "task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "system__schedule_task",
+            "description": (
+                "Schedule a task to run automatically at a specified time or recurrence. "
+                "Use when the user asks to schedule, automate, plan, or set a reminder for a recurring or one-time action. "
+                "Supports: once (exact datetime), daily (every day at HH:MM), weekly (day + time), "
+                "hourly (every hour at :MM), interval (every N minutes)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Short human-readable name for the task"},
+                    "instruction": {"type": "string", "description": "Full instruction to execute when the task runs (as if the user typed it)"},
+                    "schedule_type": {
+                        "type": "string",
+                        "enum": ["once", "daily", "weekly", "hourly", "interval"],
+                        "description": "Type of schedule",
+                    },
+                    "datetime": {"type": "string", "description": "ISO 8601 datetime for 'once' type (e.g. '2025-12-25T09:00:00')"},
+                    "time": {"type": "string", "description": "Time HH:MM for 'daily' or 'weekly' (e.g. '09:30')"},
+                    "day_of_week": {"type": "string", "description": "Day of week for 'weekly' in English or French (e.g. 'monday', 'lundi')"},
+                    "minute": {"type": "integer", "description": "Minute of the hour for 'hourly' (0-59)"},
+                    "interval_minutes": {"type": "integer", "description": "Interval in minutes for 'interval' type"},
+                },
+                "required": ["name", "instruction", "schedule_type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "system__list_tasks",
+            "description": "List all scheduled tasks with their status, next run time, and recent execution history.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "system__cancel_task",
+            "description": "Cancel (delete) or pause a scheduled task by its ID.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "The task ID to cancel (8-char string)"},
+                    "action": {
+                        "type": "string",
+                        "enum": ["delete", "pause"],
+                        "description": "delete = permanent removal, pause = temporary suspension. Default: delete",
+                        "default": "delete",
+                    },
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
 ]
 
 # Context compaction — triggered when estimated input tokens exceed threshold
@@ -155,6 +292,208 @@ def _load_llm_config() -> tuple[str, str, str]:
 def _estimate_tokens(messages: list) -> int:
     """Rough token estimate: ~4 chars per token."""
     return sum(len(str(m.get("content", ""))) for m in messages) // 4
+
+
+# ─── Anthropic direct streaming (bypasses PicoClaw to get true token streaming) ─
+
+ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VER = "2023-06-01"
+
+
+def _load_anthropic_config() -> tuple:
+    """Return (api_key, model) if Anthropic is configured in picoclaw config, else (None, '')."""
+    try:
+        with open(PICOCLAW_CONFIG) as f:
+            cfg = json.load(f)
+        entry = cfg.get("model_list", [{}])[0]
+        base = entry.get("api_base", entry.get("base_url", "")).rstrip("/")
+        key = entry.get("api_key", "")
+        model = entry.get("model", "")
+        if "anthropic.com" in base and key:
+            return key, model
+    except Exception:
+        pass
+    return None, ""
+
+
+def _to_anthropic_messages(messages: list) -> tuple:
+    """Convert OpenAI-format messages to Anthropic format. Returns (system_str|None, messages)."""
+    system = None
+    out = []
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content") or ""
+        if role == "system":
+            system = str(content)
+        elif role == "user":
+            out.append({"role": "user", "content": str(content)})
+        elif role == "assistant":
+            tcs = msg.get("tool_calls", [])
+            if tcs:
+                blocks = []
+                if content:
+                    blocks.append({"type": "text", "text": str(content)})
+                for tc in tcs:
+                    fn = tc.get("function", {})
+                    try:
+                        inp = json.loads(fn.get("arguments", "{}"))
+                    except Exception:
+                        inp = {}
+                    blocks.append({
+                        "type": "tool_use",
+                        "id": tc.get("id", ""),
+                        "name": fn.get("name", ""),
+                        "input": inp,
+                    })
+                out.append({"role": "assistant", "content": blocks})
+            else:
+                out.append({"role": "assistant", "content": str(content)})
+        elif role == "tool":
+            tc_id = msg.get("tool_call_id", "")
+            result = str(content)
+            # Group consecutive tool results into one user message (Anthropic requirement)
+            if out and out[-1]["role"] == "user" and isinstance(out[-1].get("content"), list):
+                out[-1]["content"].append({
+                    "type": "tool_result", "tool_use_id": tc_id, "content": result
+                })
+            else:
+                out.append({
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": tc_id, "content": result}]
+                })
+    return system, out
+
+
+def _to_anthropic_tools(tools: list) -> list:
+    """Convert OpenAI function tools to Anthropic tool format."""
+    result = []
+    for t in tools:
+        if t.get("type") == "function":
+            fn = t["function"]
+            result.append({
+                "name": fn.get("name", ""),
+                "description": fn.get("description", ""),
+                "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
+            })
+    return result
+
+
+def _call_anthropic_stream(body: dict):
+    """
+    Call Anthropic API directly with streaming. body is in OpenAI format.
+    Yields:
+      {"type": "content_delta", "text": "..."}   — text tokens as generated
+      {"type": "response", "message": {...}, "finish_reason": "..."}  — final assembled msg
+      {"type": "error", "message": "..."}         — on failure
+    """
+    api_key, default_model = _load_anthropic_config()
+    model = body.get("model") or default_model or "claude-haiku-4-5-20251001"
+    max_tokens = body.get("max_tokens", 8192)
+    tools = body.get("tools", [])
+
+    system, anthro_msgs = _to_anthropic_messages(body.get("messages", []))
+    anthro_tools = _to_anthropic_tools(tools)
+
+    payload = {
+        "model": model,
+        "messages": anthro_msgs,
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+    if system:
+        payload["system"] = system
+    if anthro_tools:
+        payload["tools"] = anthro_tools
+        payload["tool_choice"] = {"type": "auto"}
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": api_key,
+        "anthropic-version": ANTHROPIC_VER,
+    }
+
+    content_parts = []
+    tool_blocks = {}   # index -> {id, name, input_str}
+    finish_reason = "stop"
+
+    try:
+        req = urllib.request.Request(
+            ANTHROPIC_API, data=json.dumps(payload).encode(), headers=headers, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8").rstrip("\r\n")
+                if not line.startswith("data: "):
+                    continue
+                chunk_str = line[6:]
+                if chunk_str.strip() == "[DONE]":
+                    break
+                try:
+                    ev = json.loads(chunk_str)
+                except Exception:
+                    continue
+
+                ev_type = ev.get("type", "")
+
+                if ev_type == "content_block_start":
+                    idx = ev.get("index", 0)
+                    block = ev.get("content_block", {})
+                    if block.get("type") == "tool_use":
+                        tool_blocks[idx] = {
+                            "id": block.get("id", ""),
+                            "name": block.get("name", ""),
+                            "input_str": "",
+                        }
+
+                elif ev_type == "content_block_delta":
+                    idx = ev.get("index", 0)
+                    delta = ev.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        text = delta.get("text", "")
+                        if text:
+                            content_parts.append(text)
+                            yield {"type": "content_delta", "text": text}
+                    elif delta.get("type") == "input_json_delta":
+                        if idx in tool_blocks:
+                            tool_blocks[idx]["input_str"] += delta.get("partial_json", "")
+
+                elif ev_type == "message_delta":
+                    stop_reason = ev.get("delta", {}).get("stop_reason", "")
+                    if stop_reason == "tool_use":
+                        finish_reason = "tool_calls"
+                    elif stop_reason:
+                        finish_reason = stop_reason
+
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode(errors="replace")
+        log.error("Anthropic API HTTP %d: %s", e.code, body_text)
+        yield {"type": "error", "message": f"Anthropic API error {e.code}: {body_text[:200]}"}
+        return
+    except Exception as e:
+        log.error("Anthropic stream failed: %s", e)
+        yield {"type": "error", "message": f"Anthropic API unreachable: {e}"}
+        return
+
+    # Reconstruct OpenAI-compatible message from accumulated chunks
+    content = "".join(content_parts)
+    message = {"role": "assistant", "content": content or None}
+    if tool_blocks:
+        message["tool_calls"] = []
+        for idx in sorted(tool_blocks):
+            tb = tool_blocks[idx]
+            try:
+                inp = json.loads(tb["input_str"]) if tb["input_str"] else {}
+                args_str = json.dumps(inp)
+            except Exception:
+                args_str = tb["input_str"]
+            message["tool_calls"].append({
+                "id": tb["id"],
+                "type": "function",
+                "function": {"name": tb["name"], "arguments": args_str},
+            })
+        finish_reason = "tool_calls"
+
+    yield {"type": "response", "message": message, "finish_reason": finish_reason}
 
 
 def _compact_messages(messages: list) -> list:
@@ -196,7 +535,7 @@ def _compact_messages(messages: list) -> list:
         url, data=json.dumps(summary_body).encode(), headers=headers, method="POST"
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=90) as resp:
             data = json.loads(resp.read())
         summary_text = data["choices"][0]["message"]["content"]
     except Exception as e:
@@ -239,19 +578,12 @@ def chat_with_tools(request_body: dict, override_tools: list = None) -> dict:
         tool_names = ", ".join(
             t["function"]["name"] for t in tools if t.get("type") == "function"
         )
-        system_content = (
-            "You are ClawbotOS Core, an AI assistant running on a Raspberry Pi (AllWinner H3, armhf/arm64). "
-            f"You have access to the following tools: {tool_names}. "
-            "ALWAYS use your tools to complete tasks — never just describe how to do something. "
-            "Execute commands, write files, and run code directly. "
-            "Be concise and action-oriented.\n"
-            "Hardware tips: CPU temp via `cat /sys/class/thermal/thermal_zone0/temp` (divide by 1000 for °C) — "
-            "vcgencmd is NOT available on AllWinner. "
-            "Network interface is end0 (Ethernet) or wlx* (WiFi USB), not eth0. "
-            "Use `ip addr` not `ifconfig`. "
-            "Prefer stdlib-only Python (no pip). "
-            "When a command fails, try an alternative instead of giving up."
-        )
+        _prompts = _load_core_prompts()
+        _template = _prompts.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
+        _extra = _prompts.get("extra_rules", "").strip()
+        system_content = _template.replace("{tools}", tool_names)
+        if _extra:
+            system_content += "\n\n" + _extra
         body["messages"] = [{"role": "system", "content": system_content}] + messages
     # Tool loop requires non-streaming internally
     body["stream"] = False
@@ -357,20 +689,37 @@ def chat_with_tools_stream(request_body: dict, override_tools: list = None):
         tool_names = ", ".join(
             t["function"]["name"] for t in tools if t.get("type") == "function"
         )
-        system_content = (
-            "You are ClawbotOS Core, an AI assistant running on a Raspberry Pi (AllWinner H3, armhf/arm64). "
-            f"You have access to the following tools: {tool_names}. "
-            "ALWAYS use your tools to complete tasks — never just describe how to do something. "
-            "Execute commands, write files, and run code directly. "
-            "Be concise and action-oriented.\n"
-            "Hardware tips: CPU temp via `cat /sys/class/thermal/thermal_zone0/temp` (divide by 1000 for °C) — "
-            "vcgencmd is NOT available on AllWinner. "
-            "Network interface is end0 (Ethernet) or wlx* (WiFi USB), not eth0. "
-            "Use `ip addr` not `ifconfig`. "
-            "Prefer stdlib-only Python (no pip). "
-            "When a command fails, try an alternative instead of giving up."
-        )
+        _prompts = _load_core_prompts()
+        _template = _prompts.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
+        _extra = _prompts.get("extra_rules", "").strip()
+        system_content = _template.replace("{tools}", tool_names)
+        if _extra:
+            system_content += "\n\n" + _extra
         body["messages"] = [{"role": "system", "content": system_content}] + messages
+
+    # Inject matched skills into system prompt
+    _user_msg = next(
+        (m.get("content", "") if isinstance(m.get("content"), str)
+         else (m["content"][0].get("text", "") if m.get("content") else "")
+         for m in reversed(body.get("messages", []))
+         if m.get("role") == "user"),
+        "")
+    try:
+        from skills import match_skills, build_skill_prompt
+        _matched = match_skills(_user_msg)
+        _skill_section = build_skill_prompt(_matched)
+        if _skill_section:
+            _msgs = body.get("messages", [])
+            if _msgs and _msgs[0].get("role") == "system":
+                _msgs = list(_msgs)
+                _msgs[0] = dict(_msgs[0])
+                _msgs[0]["content"] = _msgs[0]["content"] + "\n\n" + _skill_section
+                body["messages"] = _msgs
+            else:
+                body["messages"] = [{"role": "system", "content": _skill_section}] + _msgs
+    except Exception as _e:
+        log.debug("Skills injection skipped: %s", _e)
+
     body["stream"] = False
 
     _, _, default_model = _load_llm_config()
@@ -382,6 +731,7 @@ def chat_with_tools_stream(request_body: dict, override_tools: list = None):
 
     for round_num in range(MAX_TOOL_ROUNDS):
         estimated = _estimate_tokens(body["messages"])
+        yield {"type": "context_usage", "tokens": estimated, "max": COMPACT_THRESHOLD}
         if estimated > COMPACT_THRESHOLD:
             yield {"type": "thinking", "message": f"Compacting context (~{estimated // 1000}k tokens)..."}
             log.info("Context too large (~%d tokens), auto-compacting...", estimated)
@@ -393,14 +743,32 @@ def chat_with_tools_stream(request_body: dict, override_tools: list = None):
             yield {"type": "thinking", "message": f"Analyzing results — round {round_num + 1}/{MAX_TOOL_ROUNDS}"}
 
         log.info("Tool loop round %d/%d (stream)", round_num + 1, MAX_TOOL_ROUNDS)
-        response = _call_picoclaw(body)
 
-        if not response.get("choices"):
-            yield {"type": "error", "message": str(response)}
-            return
-
-        choice = response["choices"][0]
-        finish = choice.get("finish_reason", "stop")
+        # Use Anthropic direct streaming when configured — gives real-time token output.
+        # Falls back to PicoClaw (non-streaming, bulk response) for other providers.
+        anthro_key, _ = _load_anthropic_config()
+        choice = None
+        finish = "stop"
+        if anthro_key:
+            for llm_ev in _call_anthropic_stream(body):
+                if llm_ev["type"] == "content_delta":
+                    yield {"type": "content_delta", "text": llm_ev["text"]}
+                elif llm_ev["type"] == "response":
+                    choice = {"message": llm_ev["message"], "finish_reason": llm_ev["finish_reason"]}
+                    finish = llm_ev["finish_reason"]
+                elif llm_ev["type"] == "error":
+                    yield {"type": "error", "message": llm_ev["message"]}
+                    return
+            if not choice:
+                yield {"type": "error", "message": "No response from Anthropic"}
+                return
+        else:
+            response = _call_picoclaw(body)
+            if not response.get("choices"):
+                yield {"type": "error", "message": str(response)}
+                return
+            choice = response["choices"][0]
+            finish = choice.get("finish_reason", "stop")
 
         if finish != "tool_calls":
             content = (choice.get("message", {}).get("content") or "").strip().replace("\U0001F99E", "")
@@ -473,20 +841,31 @@ def chat_with_tools_stream(request_body: dict, override_tools: list = None):
 
         yield {"type": "tool_result", "round": round_num + 1, "results": results_list}
 
-    # Safety fallback after max rounds
+    # Safety fallback after max rounds — force a summary response
+    log.warning("Reached max tool rounds (%d), forcing final summary", MAX_TOOL_ROUNDS)
     yield {"type": "thinking", "message": "Preparing final response..."}
     body.pop("tools", None)
     body.pop("tool_choice", None)
+    # Inject explicit instruction to summarize rather than call more tools
+    body["messages"].append({
+        "role": "user",
+        "content": "[System: You have reached the maximum number of tool calls. Summarize what you have done and what was accomplished. If the task is incomplete, explain what remains and why.]"
+    })
     response = _call_picoclaw(body)
     content = (response.get("choices", [{}])[0].get("message", {}).get("content") or "").strip().replace("\U0001F99E", "")
+    if not content:
+        content = "Task completed. Maximum tool rounds reached."
     yield {"type": "done", "content": content}
 
 
 def _call_picoclaw(body: dict) -> dict:
-    """POST request_body to the configured LLM API and return parsed JSON response."""
+    """POST request_body to the configured LLM API and return parsed JSON response.
+
+    PicoClaw proxies to Anthropic synchronously (non-streaming) and sends the full
+    response in one shot. LLM_TIMEOUT is set high enough to cover any generation.
+    """
     url, api_key, default_model = _load_llm_config()
 
-    # Ensure a model is set
     payload = dict(body)
     if not payload.get("model") or payload.get("model") == "default":
         if default_model:
@@ -495,6 +874,14 @@ def _call_picoclaw(body: dict) -> dict:
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+
+    payload["stream"] = False
+    # Prevent cloud from routing this back to the device via WebSocket tunnel.
+    # Without this flag, cloud sees the device online and forwards the request back,
+    # creating a second orchestrator instance that handles the tool loop silently.
+    # With this flag, cloud calls Anthropic directly and returns finish_reason: "tool_calls"
+    # so THIS orchestrator instance handles the tool loop and emits tool_call/tool_result SSE events.
+    payload["_from_tunnel"] = True
 
     data = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
@@ -637,6 +1024,143 @@ def _execute_builtin(tool_suffix: str, arguments: dict) -> str:
         except Exception as e:
             return f"[error] {e}"
 
+    if tool_suffix == "spawn_agents":
+        import threading
+        tasks = arguments.get("tasks", [])
+        agent_timeout = int(arguments.get("timeout", 120))
+        if not tasks:
+            return "[error] No tasks provided"
+        agents = load_agents()
+        results = {}
+        errors = {}
+
+        def _run_agent_task(agent_id: str, task_text: str):
+            if agent_id not in agents:
+                errors[agent_id] = f"Agent '{agent_id}' not found"
+                return
+            body = {"messages": [{"role": "user", "content": task_text}]}
+            text_parts = []
+            try:
+                for event in chat_with_agent_stream(body, agent_id):
+                    if event.get("type") == "text":
+                        text_parts.append(event.get("text", ""))
+                    elif event.get("type") == "error":
+                        errors[agent_id] = event.get("message", "unknown error")
+                        return
+                results[agent_id] = "".join(text_parts).strip() or "(no output)"
+            except Exception as e:
+                errors[agent_id] = str(e)
+
+        threads = []
+        for item in tasks:
+            agent_id = item.get("agent", "")
+            task_text = item.get("task", "")
+            if not agent_id or not task_text:
+                continue
+            t = threading.Thread(target=_run_agent_task, args=(agent_id, task_text), daemon=True)
+            threads.append((agent_id, t))
+            t.start()
+
+        for agent_id, t in threads:
+            t.join(timeout=agent_timeout)
+            if t.is_alive():
+                errors[agent_id] = f"Timed out after {agent_timeout}s"
+
+        parts = []
+        for item in tasks:
+            aid = item.get("agent", "")
+            task = item.get("task", "")
+            agent_name = agents.get(aid, {}).get("name", aid) if aid in agents else aid
+            if aid in errors:
+                parts.append(f"### {agent_name}\n**Error:** {errors[aid]}")
+            else:
+                parts.append(f"### {agent_name}\n{results.get(aid, '(no response)')}")
+
+        return "\n\n".join(parts)
+
+    if tool_suffix == "schedule_task":
+        from scheduler import create_task
+        name = arguments.get("name", "Unnamed task")
+        instruction = arguments.get("instruction", "")
+        schedule_type = arguments.get("schedule_type", "once")
+        if not instruction:
+            return "[error] No instruction provided"
+        kwargs = {k: v for k, v in arguments.items() if k not in ("name", "instruction", "schedule_type")}
+        try:
+            task = create_task(name, instruction, schedule_type, **kwargs)
+            return f"Task created: '{task['name']}' (id: {task['id']}) — next run: {task.get('next_run', 'N/A')}"
+        except Exception as e:
+            return f"[error] {e}"
+
+    if tool_suffix == "list_tasks":
+        from scheduler import list_tasks
+        try:
+            tasks = list_tasks()
+            if not tasks:
+                return "No scheduled tasks."
+            lines = []
+            for t in tasks:
+                status = t.get("status", "unknown")
+                next_run = t.get("next_run") or "N/A"
+                last_run = t.get("last_run") or "never"
+                lines.append(
+                    f"- [{t['id']}] {t['name']} | type: {t['schedule_type']} | "
+                    f"status: {status} | next: {next_run} | last: {last_run}"
+                )
+            return "\n".join(lines)
+        except Exception as e:
+            return f"[error] {e}"
+
+    if tool_suffix == "cancel_task":
+        from scheduler import delete_task, pause_task
+        task_id = arguments.get("task_id", "")
+        action = arguments.get("action", "delete")
+        if not task_id:
+            return "[error] No task_id provided"
+        try:
+            if action == "pause":
+                ok = pause_task(task_id)
+                return f"Task {task_id} paused." if ok else f"[error] Task {task_id} not found"
+            else:
+                ok = delete_task(task_id)
+                return f"Task {task_id} deleted." if ok else f"[error] Task {task_id} not found"
+        except Exception as e:
+            return f"[error] {e}"
+
+    if tool_suffix == "handoff":
+        agent_id = arguments.get("agent_id", "")
+        task = arguments.get("task", "")
+        context = arguments.get("context", "")
+        expected_output = arguments.get("expected_output", "")
+        if not agent_id or not task:
+            return "[error] handoff requires agent_id and task"
+        agents = load_agents()
+        if agent_id not in agents:
+            available = ", ".join(agents.keys())
+            return f"[error] Unknown agent: '{agent_id}'. Available: {available}"
+        # Build structured handoff brief
+        parts = ["[HANDOFF BRIEF]"]
+        if context:
+            parts.append(f"Context: {context}")
+        parts.append(f"Task: {task}")
+        if expected_output:
+            parts.append(f"Expected output: {expected_output}")
+        parts.append("---\nRespond directly and concisely. No need to introduce yourself.")
+        handoff_msg = "\n".join(parts)
+        body = {"messages": [{"role": "user", "content": handoff_msg}], "model": "default"}
+        result_parts = []
+        try:
+            for ev in chat_with_agent_stream(body, agent_id):
+                if ev.get("type") == "done":
+                    result_parts.append(ev.get("content", ""))
+                elif ev.get("type") == "text":
+                    result_parts.append(ev.get("text", ""))
+        except Exception as e:
+            return f"[error] Handoff to '{agent_id}' failed: {e}"
+        agent_name = agents[agent_id].get("name", agent_id)
+        result = "".join(result_parts).strip() or "(no response)"
+        return f"[Handoff → {agent_name}]\n{result}"
+
     return f"[error] Unknown built-in tool: system__{tool_suffix}"
 
 
@@ -766,37 +1290,103 @@ def _error_response(message: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# Twins Partner — quality reviewer for agent responses
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_TWINS_REVIEWER_PROMPT = (
+    "You are a quality reviewer. You receive an original task and an agent's response. "
+    "Evaluate whether the response correctly and completely fulfills the task. "
+    "Reply with EXACTLY one of these two formats:\n"
+    "[APPROVED] <one-line validation note>\n"
+    "[NEEDS_REVISION] <specific issue 1>; <specific issue 2>; ...\n"
+    "Be concise. Focus on: correctness, completeness, and whether the expected output was delivered. "
+    "Do NOT redo the work yourself — only evaluate."
+)
+
+
+def _twins_review(original_task: str, agent_response: str, agent_name: str) -> tuple:
+    """Run a Haiku reviewer pass on agent output. Returns (approved: bool, feedback: str)."""
+    api_key, _ = _load_anthropic_config()
+    if not api_key:
+        return True, "(no reviewer — Anthropic key required for Twins Partner)"
+
+    # Load reviewer prompt from config (editable live in UI), fallback to default constant
+    reviewer_system = _TWINS_REVIEWER_PROMPT
+    try:
+        cfg = _load_core_prompts()
+        if cfg.get("twins_reviewer_prompt", "").strip():
+            reviewer_system = cfg["twins_reviewer_prompt"]
+    except Exception:
+        pass
+
+    review_prompt = (
+        f"Original task:\n{original_task}\n\n"
+        f"Response from {agent_name}:\n{agent_response[:4000]}\n\n"
+        "Evaluate and reply with [APPROVED] or [NEEDS_REVISION]."
+    )
+    payload = json.dumps({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 300,
+        "system": reviewer_system,
+        "messages": [{"role": "user", "content": review_prompt}],
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=payload,
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+        text = (data.get("content") or [{}])[0].get("text", "").strip()
+        if text.startswith("[APPROVED]"):
+            return True, text[len("[APPROVED]"):].strip()
+        elif text.startswith("[NEEDS_REVISION]"):
+            return False, text[len("[NEEDS_REVISION]"):].strip()
+        # Ambiguous response — approve by default
+        return True, text[:100]
+    except Exception as e:
+        log.warning("Twins review failed: %s", e)
+        return True, "(reviewer error — approved by default)"
+
+
 # Sub-Agent System — configurable personas with skills, routing & parallel exec
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _DEFAULT_AGENTS = [
     {
-        "id": "python-dev",
-        "name": "Python Dev",
+        "id": "julien",
+        "name": "Julien — Python Dev",
         "avatar": "\U0001f40d",
         "color": "#3776ab",
         "system_prompt": (
-            "You are an expert Python developer running on ClawbotOS (Raspberry Pi, AllWinner H3). "
+            "You are Julien, an expert Python developer running on ClawbotOS (Raspberry Pi, AllWinner H3). "
             "Write clean, efficient Python code. Use stdlib when possible (no pip on this device). "
             "Always execute code with your tools — never just describe what to do. Be concise."
         ),
-        "skills": ["system__python", "system__bash", "system__write_file", "system__read_file"],
+        "skills": ["system__python", "system__bash", "system__write_file", "system__read_file", "system__handoff"],
         "keywords": ["python", "script", "code", "function", "class", "debug", "pip", "module", "import", "def",
                      "programme", "coder", "variable", "boucle", "erreur"],
         "enabled": True,
     },
     {
-        "id": "sysadmin",
-        "name": "SysAdmin",
+        "id": "marc",
+        "name": "Marc — Sysadmin",
         "avatar": "\U0001f527",
         "color": "#e74c3c",
         "system_prompt": (
-            "You are a Linux system administrator expert on ClawbotOS (Raspberry Pi, AllWinner H3, Armbian). "
+            "You are Marc, a Linux system administrator expert on ClawbotOS (Raspberry Pi, AllWinner H3, Armbian). "
             "You manage services, network, storage, security. Interface: end0 (Ethernet), wlx* (WiFi USB). "
             "Use `ip addr` not `ifconfig`. CPU temp: `cat /sys/class/thermal/thermal_zone0/temp` / 1000. "
             "Be concise and action-oriented."
         ),
-        "skills": ["system__bash", "system__read_file", "system__write_file", "system__ssh"],
+        "skills": ["system__bash", "system__read_file", "system__write_file", "system__ssh", "system__handoff"],
         "keywords": ["system", "service", "network", "disk", "memory", "cpu", "process", "linux", "server",
                      "ssh", "firewall", "log", "systemctl", "apt", "admin", "config", "daemon",
                      "serveur", "connecter", "connexion", "reseau", "disque", "memoire", "processus",
@@ -805,16 +1395,16 @@ _DEFAULT_AGENTS = [
         "enabled": True,
     },
     {
-        "id": "web-researcher",
-        "name": "Web Researcher",
+        "id": "sophie",
+        "name": "Sophie — Web Researcher",
         "avatar": "\U0001f310",
         "color": "#2ecc71",
         "system_prompt": (
-            "You are a web research specialist. Search the internet to find accurate, up-to-date information. "
+            "You are Sophie, a web research specialist. Search the internet to find accurate, up-to-date information. "
             "Summarize findings clearly with sources. Cross-reference multiple results for accuracy. "
             "Always use your web_search tool to answer questions."
         ),
-        "skills": ["system__web_search", "system__bash"],
+        "skills": ["system__web_search", "system__bash", "system__handoff"],
         "keywords": ["search", "find", "research", "google", "web", "internet", "look up", "information",
                      "what is", "who is", "how to", "documentation", "tutorial",
                      "chercher", "rechercher", "trouver", "internet", "c'est quoi", "qu'est-ce que",
@@ -822,16 +1412,16 @@ _DEFAULT_AGENTS = [
         "enabled": True,
     },
     {
-        "id": "file-manager",
-        "name": "File Manager",
+        "id": "thierry",
+        "name": "Thierry — File Manager",
         "avatar": "\U0001f4c1",
         "color": "#f39c12",
         "system_prompt": (
-            "You are a file management specialist on ClawbotOS. You organize, read, write, and manage files "
+            "You are Thierry, a file management specialist on ClawbotOS. You organize, read, write, and manage files "
             "efficiently. You can create scripts, config files, and documentation. "
             "Always show file contents or confirmation after operations."
         ),
-        "skills": ["system__read_file", "system__write_file", "system__bash"],
+        "skills": ["system__read_file", "system__write_file", "system__bash", "system__handoff"],
         "keywords": ["file", "folder", "directory", "create", "write", "read", "edit", "move", "copy",
                      "delete", "config", "json", "yaml", "txt", "save",
                      "fichier", "dossier", "repertoire", "creer", "ecrire", "lire", "modifier",
@@ -904,11 +1494,14 @@ def _route_via_llm(user_message: str, agents: dict) -> str | None:
         descs.append(f"- id: {a['id']} | name: {a['name']} | skills: {skills} | role: {desc}")
 
     prompt = (
-        "Tu es un routeur intelligent. Analyse le message utilisateur et choisis l'agent le plus adapté.\n\n"
+        "Tu es un routeur. Décide si le message nécessite un agent spécialisé ou peut être traité directement.\n\n"
+        "Règle principale : réponds 'none' si :\n"
+        "- la conversation est simple, générale ou conversationnelle (salutations, questions ouvertes, discussions)\n"
+        "- aucune compétence spécifique d'un agent n'est clairement requise\n"
+        "Ne sélectionne un agent QUE si la tâche nécessite ses compétences précises.\n\n"
         "Agents disponibles:\n" + "\n".join(descs) + "\n\n"
-        f"Message utilisateur: \"{user_message}\"\n\n"
-        "Réponds UNIQUEMENT avec l'id de l'agent le plus adapté (ex: sysadmin). "
-        "Si aucun agent ne correspond, réponds: none"
+        f"Message: \"{user_message}\"\n\n"
+        "Réponds UNIQUEMENT avec l'id de l'agent (ex: julien) ou: none"
     )
 
     url, api_key, _ = _load_llm_config()
@@ -957,21 +1550,29 @@ def _route_via_keywords(user_message: str, agents: dict) -> list:
 
 
 def route_to_agents(user_message: str, agents: dict = None) -> list:
-    """Route user message to the best agent using LLM classification (Haiku).
-    Falls back to keyword matching if LLM call fails.
-    Returns list of agent configs sorted by relevance.
+    """Route user message to the best agent.
+    Haiku decides whether an agent is needed at all (returns 'none' for simple messages).
+    Shortcut: messages ≤ 3 words go directly to Core without calling Haiku.
+    Returns list of agent configs, or [] for Core fallback.
     """
     if agents is None:
         agents = load_agents()
 
-    # Primary: LLM-based routing via Haiku
-    chosen_id = _route_via_llm(user_message, agents)
+    msg = user_message.strip()
+
+    # Shortcut: very short messages → Core directly, no LLM call
+    if len(msg.split()) <= 3:
+        log.info("Short message — Core direct (skip routing)")
+        return []
+
+    # Haiku decides: agent id or "none" (simple/conversational → Core)
+    chosen_id = _route_via_llm(msg, agents)
     if chosen_id:
+        log.info("Haiku routing → %s", chosen_id)
         return [agents[chosen_id]]
 
-    # Fallback: keyword-based routing
-    log.info("LLM routing returned no match, trying keyword fallback")
-    return _route_via_keywords(user_message, agents)
+    log.info("Haiku chose none — Core direct")
+    return []
 
 
 def _build_agent_tools(agent_config: dict) -> list:
@@ -1003,16 +1604,71 @@ def chat_with_agent_stream(request_body: dict, agent_id: str):
         "Execute commands, write files, and run code directly."
     )
 
+    # Inject matched skills into agent system prompt
+    _agent_user_msg = next(
+        (m.get("content", "") if isinstance(m.get("content"), str)
+         else (m["content"][0].get("text", "") if m.get("content") else "")
+         for m in reversed(request_body.get("messages", []))
+         if m.get("role") == "user"),
+        "")
+    try:
+        from skills import match_skills, build_skill_prompt
+        _matched = match_skills(_agent_user_msg)
+        _skill_section = build_skill_prompt(_matched)
+        if _skill_section:
+            system_prompt += "\n\n" + _skill_section
+    except Exception as _e:
+        log.debug("Skills injection skipped in agent: %s", _e)
+
     body = dict(request_body)
     messages = [m for m in body.get("messages", []) if m.get("role") != "system"]
     body["messages"] = [{"role": "system", "content": system_prompt}] + messages
 
+    # Inject available agents for handoff awareness
+    if "system__handoff" in (agent.get("skills") or []):
+        all_agents = load_agents()
+        other_agents = [
+            f"- {a['id']}: {a.get('name', a['id'])} ({', '.join(a.get('skills', [])[:2])})"
+            for aid, a in all_agents.items() if aid != agent_id and a.get("enabled", True)
+        ]
+        if other_agents:
+            system_prompt += (
+                "\n\nAvailable agents you can delegate to via system__handoff:\n"
+                + "\n".join(other_agents)
+                + "\nUse system__handoff when a task falls outside your expertise."
+            )
+
     agent_name = agent.get("name", agent_id)
+    twins_enabled = agent.get("twins_partner", False)
     yield {"type": "thinking", "message": f"Agent {agent_name} initializing...", "agent_id": agent_id}
 
+    # Stream main agent response, collect full text for optional review
+    full_response = ""
     for event in chat_with_tools_stream(body, override_tools=tools):
         event["agent_id"] = agent_id
+        if event.get("type") == "done":
+            full_response = event.get("content", "")
         yield event
+
+    # Twins Partner review cycle
+    if twins_enabled and full_response and _agent_user_msg:
+        yield {"type": "thinking", "message": "🔍 Twins Partner reviewing response...", "agent_id": agent_id}
+        approved, feedback = _twins_review(_agent_user_msg, full_response, agent_name)
+        if approved:
+            yield {"type": "thinking", "message": f"✓ Twins Partner: {feedback or 'approved'}", "agent_id": agent_id}
+        else:
+            yield {"type": "thinking", "message": f"⚠ Twins Partner found issues — requesting revision...", "agent_id": agent_id}
+            revision_content = (
+                f"{_agent_user_msg}\n\n"
+                f"[REVISION REQUEST — quality reviewer found issues]\n{feedback}\n\n"
+                "Please fix the issues above and provide a corrected, complete response."
+            )
+            revision_body = dict(body)
+            sys_msg = [m for m in body["messages"] if m.get("role") == "system"]
+            revision_body["messages"] = sys_msg + [{"role": "user", "content": revision_content}]
+            for event in chat_with_tools_stream(revision_body, override_tools=tools):
+                event["agent_id"] = agent_id
+                yield event
 
 
 def chat_with_multi_agents_stream(request_body: dict, agent_ids: list):

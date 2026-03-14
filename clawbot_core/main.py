@@ -22,6 +22,13 @@ Endpoints:
   GET  /core/workspace             — list workspace files
   GET  /core/workspace/{file}      — download workspace file
 
+  GET  /core/skills                — list all skills (including disabled)
+  GET  /core/skills/{id}           — get skill by id
+  POST /core/skills[/{id}]         — create/update skill  body: {id, name, triggers, instructions, ...}
+  POST /core/skills/{id}/enable    — enable skill
+  POST /core/skills/{id}/disable   — disable skill
+  DELETE /core/skills/{id}         — delete skill (builtin skills cannot be deleted)
+
   POST /v1/chat/completions        — tool-aware chat proxy (→ PicoClaw + module tools)
 """
 
@@ -39,7 +46,7 @@ import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs
 
 SESSIONS_DIR = "/home/pi/.clawbot/sessions"
 
@@ -426,13 +433,24 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/core/workspace":
             workspace = "/home/pi/.picoclaw/workspace"
+            qs = parse_qs(urlparse(self.path).query)
+            sub = qs.get("path", [""])[0].strip("/")
+            target = os.path.normpath(os.path.join(workspace, sub)) if sub else workspace
+            if not target.startswith(workspace):
+                self.send_json(403, {"error": "Forbidden"}); return
             try:
                 entries = []
-                for f in sorted(os.listdir(workspace)):
-                    fp = os.path.join(workspace, f)
-                    if os.path.isfile(fp):
-                        entries.append({"name": f, "size": os.path.getsize(fp)})
-                self.send_json(200, {"files": entries})
+                for f in sorted(os.listdir(target), key=lambda x: x.lower()):
+                    fp = os.path.join(target, f)
+                    st = os.stat(fp)
+                    entries.append({
+                        "name": f,
+                        "path": (sub + "/" + f).lstrip("/") if sub else f,
+                        "size": st.st_size,
+                        "mtime": st.st_mtime,
+                        "type": "dir" if os.path.isdir(fp) else "file"
+                    })
+                self.send_json(200, {"files": entries, "path": sub})
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
 
@@ -485,6 +503,49 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, agents[agent_id])
             else:
                 self.send_json(404, {"error": f"Agent '{agent_id}' not found"})
+
+        elif path == "/core/skills":
+            from skills import load_skills
+            try:
+                skills = load_skills(include_disabled=True)
+                self.send_json(200, {"skills": list(skills.values())})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path.startswith("/core/skills/"):
+            from skills import load_skills
+            skill_id = path[len("/core/skills/"):]
+            if ".." in skill_id or "/" in skill_id:
+                self.send_json(400, {"error": "invalid id"})
+                return
+            skills = load_skills(include_disabled=True)
+            if skill_id in skills:
+                self.send_json(200, skills[skill_id])
+            else:
+                self.send_json(404, {"error": f"Skill '{skill_id}' not found"})
+
+        # ── Core prompts (system prompt + extra rules) ───────────────────────
+        elif path == "/core/prompts":
+            from orchestrator import DEFAULT_SYSTEM_PROMPT, CORE_PROMPTS_PATH, _TWINS_REVIEWER_PROMPT
+            try:
+                with open(CORE_PROMPTS_PATH) as f:
+                    data = json.load(f)
+            except FileNotFoundError:
+                data = {"system_prompt": DEFAULT_SYSTEM_PROMPT, "extra_rules": ""}
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+                return
+            # Inject default twins reviewer prompt if not yet saved
+            if "twins_reviewer_prompt" not in data:
+                data["twins_reviewer_prompt"] = _TWINS_REVIEWER_PROMPT
+            self.send_json(200, data)
+
+        elif path == "/core/tasks":
+            from scheduler import list_tasks
+            try:
+                self.send_json(200, list_tasks())
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
 
         # ── OpenAI-compatible model listing (required by Open WebUI, LibreChat, etc.) ──
         elif path == "/v1/models":
@@ -618,6 +679,101 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(500, {"error": str(e)})
             return
 
+        # Skill create/update/enable/disable
+        if path == "/core/skills" or path.startswith("/core/skills/"):
+            from skills import load_skills, save_skill
+            remainder = path[len("/core/skills"):].lstrip("/")
+            # enable/disable: POST /core/skills/{id}/enable or /disable
+            if "/" in remainder:
+                parts = remainder.split("/", 1)
+                skill_id, action = parts[0], parts[1]
+                if ".." in skill_id or ".." in action:
+                    self.send_json(400, {"error": "invalid id"})
+                    return
+                if action in ("enable", "disable"):
+                    skills = load_skills(include_disabled=True)
+                    if skill_id not in skills:
+                        self.send_json(404, {"error": f"Skill '{skill_id}' not found"})
+                        return
+                    skill = dict(skills[skill_id])
+                    skill["enabled"] = (action == "enable")
+                    try:
+                        save_skill(skill)
+                        self.send_json(200, {"ok": True})
+                    except Exception as e:
+                        self.send_json(500, {"error": str(e)})
+                else:
+                    self.send_json(400, {"error": f"Unknown action '{action}'"})
+                return
+            # create/update: POST /core/skills or /core/skills/{id}
+            skill_id = remainder or data.get("id")
+            if not skill_id:
+                self.send_json(400, {"error": "skill id required"})
+                return
+            if ".." in skill_id or "/" in skill_id:
+                self.send_json(400, {"error": "invalid id"})
+                return
+            skills = load_skills(include_disabled=True)
+            existing = skills.get(skill_id, {})
+            skill = {**existing, **data, "id": skill_id}
+            try:
+                save_skill(skill)
+                self.send_json(200, {"ok": True})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+            return
+
+        # Task create
+        if path == "/core/tasks":
+            from scheduler import create_task
+            try:
+                name = data.get("name", "Unnamed task")
+                instruction = data.get("instruction", "")
+                schedule_type = data.get("schedule_type", "once")
+                kwargs = {k: v for k, v in data.items() if k not in ("name", "instruction", "schedule_type")}
+                task = create_task(name, instruction, schedule_type, **kwargs)
+                self.send_json(200, task)
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+            return
+
+        # Task pause/resume
+        if path.startswith("/core/tasks/"):
+            from scheduler import pause_task, resume_task
+            remainder = path[len("/core/tasks/"):]
+            if "/" in remainder:
+                task_id, action = remainder.split("/", 1)
+                if ".." in task_id or ".." in action:
+                    self.send_json(400, {"error": "invalid id"})
+                    return
+                if action == "pause":
+                    ok = pause_task(task_id)
+                elif action == "resume":
+                    ok = resume_task(task_id)
+                else:
+                    self.send_json(400, {"error": f"Unknown action '{action}'"})
+                    return
+                self.send_json(200, {"ok": ok})
+            else:
+                self.send_json(400, {"error": "Use /core/tasks/{id}/pause or /resume"})
+            return
+
+        # Core prompts save
+        if path == "/core/prompts":
+            from orchestrator import CORE_PROMPTS_PATH
+            try:
+                os.makedirs(os.path.dirname(CORE_PROMPTS_PATH), exist_ok=True)
+                with open(CORE_PROMPTS_PATH, "w") as f:
+                    json.dump({
+                        "system_prompt": data.get("system_prompt", ""),
+                        "extra_rules": data.get("extra_rules", ""),
+                        "twins_reviewer_prompt": data.get("twins_reviewer_prompt", ""),
+                    }, f, indent=2)
+                self.send_json(200, {"ok": True})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+            return
+
         # Sub-agent chat with routing
         if path == "/v1/chat/agents":
             agent_ids = data.get("agent_ids", [])
@@ -633,15 +789,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
-                # Routing thinking
-                thinking = json.dumps({"type": "thinking", "message": "Routing to best agent..."})
-                self.wfile.write(f"event: thinking\ndata: {thinking}\n\n".encode())
-                self.wfile.flush()
-
                 messages = data.get("messages", [])
                 user_msg = next(
                     (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), ""
                 )
+                # Only show routing indicator for non-trivial messages
+                if len(user_msg.strip().split()) > 3:
+                    thinking = json.dumps({"type": "thinking", "message": "Sélection de l'agent..."})
+                    self.wfile.write(f"event: thinking\ndata: {thinking}\n\n".encode())
+                    self.wfile.flush()
                 matched = route_to_agents(user_msg)
                 if matched:
                     agent_ids = [a["id"] for a in matched[:1]]
@@ -656,7 +812,7 @@ class Handler(BaseHTTPRequestHandler):
                     fallback_content = None
                     try:
                         fallback_info = json.dumps({"type": "agent_start", "agents": [
-                            {"id": "core", "name": "ClawbotCore", "avatar": "\U0001f916", "color": "#00ffe0"}
+                            {"id": "core", "name": "Core", "avatar": "⚡", "color": "#00ffe0"}
                         ]})
                         self.wfile.write(f"event: agent_start\ndata: {fallback_info}\n\n".encode())
                         self.wfile.flush()
@@ -1038,6 +1194,25 @@ class Handler(BaseHTTPRequestHandler):
                 return
             delete_agent(agent_id)
             self.send_json(200, {"ok": True})
+        elif path.startswith("/core/skills/"):
+            from skills import delete_skill
+            skill_id = path[len("/core/skills/"):]
+            if ".." in skill_id or "/" in skill_id:
+                self.send_json(400, {"error": "invalid id"})
+                return
+            deleted = delete_skill(skill_id)
+            if deleted:
+                self.send_json(200, {"ok": True})
+            else:
+                self.send_json(404, {"error": f"Skill '{skill_id}' not found or is builtin"})
+        elif path.startswith("/core/tasks/"):
+            from scheduler import delete_task
+            task_id = path[len("/core/tasks/"):]
+            if ".." in task_id or "/" in task_id:
+                self.send_json(400, {"error": "invalid id"})
+                return
+            ok = delete_task(task_id)
+            self.send_json(200, {"ok": ok})
         elif path.startswith("/core/workspace/"):
             filename = unquote(path[len("/core/workspace/"):])
             if ".." in filename or "/" in filename:
@@ -1054,8 +1229,20 @@ class Handler(BaseHTTPRequestHandler):
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True  # kill threads when main process exits
 
+    def get_request(self):
+        """Override to set TCP_NODELAY on each accepted connection socket."""
+        conn, addr = super().get_request()
+        import socket as _sock
+        try:
+            conn.setsockopt(_sock.IPPROTO_TCP, _sock.TCP_NODELAY, 1)
+        except Exception:
+            pass
+        return conn, addr
+
 
 if __name__ == "__main__":
+    from scheduler import start_scheduler
+    start_scheduler()
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     log.info("ClawbotCore listening on http://127.0.0.1:%d", PORT)
     server.serve_forever()
