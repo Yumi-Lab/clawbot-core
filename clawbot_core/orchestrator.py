@@ -314,6 +314,26 @@ ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VER = "2023-06-01"
 
 
+def _load_kimi_config() -> tuple:
+    """Return (url, api_key) if a Kimi For Coding entry exists in picoclaw config, else (None, None).
+
+    The Pi has a residential IP — Kimi For Coding works from residential IPs but blocks
+    datacenter IPs (the cloud server). So kimi-for-coding requests must be called directly
+    from the Pi, not routed through the cloud.
+    """
+    try:
+        with open(PICOCLAW_CONFIG) as f:
+            cfg = json.load(f)
+        for entry in cfg.get("model_list", []):
+            base = entry.get("api_base", entry.get("base_url", "")).rstrip("/")
+            key = entry.get("api_key", "")
+            if "kimi.com" in base and key:
+                return f"{base}/chat/completions", key
+    except Exception:
+        pass
+    return None, None
+
+
 def _load_anthropic_config() -> tuple:
     """Return (api_key, model) if Anthropic is configured in picoclaw config, else (None, '')."""
     try:
@@ -920,10 +940,20 @@ def _call_picoclaw_stream(body: dict):
         if default_model:
             payload["model"] = default_model
     headers = {"Content-Type": "application/json"}
+
+    # Kimi For Coding blocks datacenter IPs — call directly from Pi (residential IP).
+    if payload.get("model") == "kimi-for-coding":
+        kimi_url, kimi_key = _load_kimi_config()
+        if kimi_url and kimi_key:
+            url = kimi_url
+            api_key = kimi_key
+            payload.pop("_from_tunnel", None)  # direct call — no tunnel flag
+
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     payload["stream"] = True
-    payload["_from_tunnel"] = True
+    if "kimi.com" not in url:
+        payload["_from_tunnel"] = True
 
     data = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
@@ -1014,16 +1044,26 @@ def _call_picoclaw(body: dict) -> dict:
             payload["model"] = default_model
 
     headers = {"Content-Type": "application/json"}
+
+    # Kimi For Coding blocks datacenter IPs — call directly from Pi (residential IP).
+    if payload.get("model") == "kimi-for-coding":
+        kimi_url, kimi_key = _load_kimi_config()
+        if kimi_url and kimi_key:
+            url = kimi_url
+            api_key = kimi_key
+            payload.pop("_from_tunnel", None)
+
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
     payload["stream"] = False
-    # Prevent cloud from routing this back to the device via WebSocket tunnel.
-    # Without this flag, cloud sees the device online and forwards the request back,
-    # creating a second orchestrator instance that handles the tool loop silently.
-    # With this flag, cloud calls Anthropic directly and returns finish_reason: "tool_calls"
-    # so THIS orchestrator instance handles the tool loop and emits tool_call/tool_result SSE events.
-    payload["_from_tunnel"] = True
+    if "kimi.com" not in url:
+        # Prevent cloud from routing this back to the device via WebSocket tunnel.
+        # Without this flag, cloud sees the device online and forwards the request back,
+        # creating a second orchestrator instance that handles the tool loop silently.
+        # With this flag, cloud calls Anthropic directly and returns finish_reason: "tool_calls"
+        # so THIS orchestrator instance handles the tool loop and emits tool_call/tool_result SSE events.
+        payload["_from_tunnel"] = True
 
     data = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
