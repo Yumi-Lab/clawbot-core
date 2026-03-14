@@ -942,12 +942,15 @@ def _call_picoclaw_stream(body: dict):
     headers = {"Content-Type": "application/json"}
 
     # Kimi For Coding blocks datacenter IPs — call directly from Pi (residential IP).
+    # Also rejects tool_calls/tools in payload — strip them for direct Kimi calls.
     if payload.get("model") == "kimi-for-coding":
         kimi_url, kimi_key = _load_kimi_config()
         if kimi_url and kimi_key:
             url = kimi_url
             api_key = kimi_key
-            payload.pop("_from_tunnel", None)  # direct call — no tunnel flag
+            payload.pop("_from_tunnel", None)
+            payload.pop("tools", None)
+            payload.pop("tool_choice", None)
 
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -1046,12 +1049,15 @@ def _call_picoclaw(body: dict) -> dict:
     headers = {"Content-Type": "application/json"}
 
     # Kimi For Coding blocks datacenter IPs — call directly from Pi (residential IP).
+    # Also rejects tools/tool_choice in payload — strip them for direct Kimi calls.
     if payload.get("model") == "kimi-for-coding":
         kimi_url, kimi_key = _load_kimi_config()
         if kimi_url and kimi_key:
             url = kimi_url
             api_key = kimi_key
             payload.pop("_from_tunnel", None)
+            payload.pop("tools", None)
+            payload.pop("tool_choice", None)
 
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
