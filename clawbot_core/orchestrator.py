@@ -47,6 +47,20 @@ LLM_TIMEOUT = 900  # 15 min — Anthropic can take a long time for complex/long 
 TOOL_TIMEOUT = 10
 TOOL_RESULT_MAX_CHARS = 6000   # truncate tool output beyond this to save tokens
 
+# ── Per-session cancellation ────────────────────────────────────────────────
+_CANCELLED_SESSIONS: set = set()
+
+def cancel_session(session_id: str):
+    """Signal a running chat_with_tools_stream to stop at next round boundary."""
+    if session_id:
+        _CANCELLED_SESSIONS.add(session_id)
+
+def is_cancelled(session_id: str) -> bool:
+    return bool(session_id and session_id in _CANCELLED_SESSIONS)
+
+def clear_cancelled(session_id: str):
+    _CANCELLED_SESSIONS.discard(session_id)
+
 # Built-in system tools — available in Core mode alongside module tools
 BUILTIN_TOOLS = [
     {
@@ -565,6 +579,21 @@ def chat_with_tools(request_body: dict, override_tools: list = None) -> dict:
         module_tools = get_enabled_tools()
         tools = BUILTIN_TOOLS + module_tools
 
+    # Patch spawn_agents tool: inject actual available agent IDs so LLM doesn't hallucinate names
+    _available_agents = load_agents()
+    if _available_agents:
+        _agent_ids_desc = "Agent ID — must be one of: " + ", ".join(
+            f"{aid} ({a.get('name', aid)})" for aid, a in _available_agents.items() if a.get("enabled", True)
+        )
+        import copy
+        tools = copy.deepcopy(tools)
+        for _t in tools:
+            if _t.get("function", {}).get("name") == "system__spawn_agents":
+                try:
+                    _t["function"]["parameters"]["properties"]["tasks"]["items"]["properties"]["agent"]["description"] = _agent_ids_desc
+                except (KeyError, TypeError):
+                    pass
+
     # Work on a copy to avoid mutating caller's data
     body = dict(request_body)
     if tools:
@@ -663,7 +692,7 @@ def chat_with_tools(request_body: dict, override_tools: list = None) -> dict:
     return _call_picoclaw(body)
 
 
-def chat_with_tools_stream(request_body: dict, override_tools: list = None):
+def chat_with_tools_stream(request_body: dict, override_tools: list = None, session_id: str = None):
     """
     Generator variant of chat_with_tools for real-time SSE streaming.
     Yields dicts: {"type": "tool_call"|"tool_result"|"done"|"error", ...}
@@ -722,14 +751,24 @@ def chat_with_tools_stream(request_body: dict, override_tools: list = None):
 
     body["stream"] = False
 
+    log.info("[MODEL] request_body model=%s", request_body.get("model"))
+
     _, _, default_model = _load_llm_config()
     if not body.get("model") or body.get("model") == "default":
         if default_model:
             body["model"] = default_model
 
+    log.info("[MODEL] after resolve: body model=%s default=%s", body.get("model"), default_model)
     model_name = body.get("model", "Claude")
 
     for round_num in range(MAX_TOOL_ROUNDS):
+        # Check if user cancelled this session
+        if is_cancelled(session_id):
+            clear_cancelled(session_id)
+            log.info("Session %s cancelled by user at round %d", session_id, round_num + 1)
+            yield {"type": "done", "content": "⛔ Tâche arrêtée par l'utilisateur."}
+            return
+
         estimated = _estimate_tokens(body["messages"])
         yield {"type": "context_usage", "tokens": estimated, "max": COMPACT_THRESHOLD}
         if estimated > COMPACT_THRESHOLD:
@@ -763,12 +802,23 @@ def chat_with_tools_stream(request_body: dict, override_tools: list = None):
                 yield {"type": "error", "message": "No response from Anthropic"}
                 return
         else:
-            response = _call_picoclaw(body)
-            if not response.get("choices"):
-                yield {"type": "error", "message": str(response)}
+            # Stream from cloud (OpenAI-compatible) — real-time token output for Kimi etc.
+            choice = None
+            finish = "stop"
+            for llm_ev in _call_picoclaw_stream(body):
+                if llm_ev["type"] == "content_delta":
+                    yield {"type": "content_delta", "text": llm_ev["text"]}
+                elif llm_ev["type"] == "thinking_delta":
+                    pass  # Kimi reasoning — accumulated in message for round-trip
+                elif llm_ev["type"] == "response":
+                    choice = {"message": llm_ev["message"], "finish_reason": llm_ev["finish_reason"]}
+                    finish = llm_ev["finish_reason"]
+                elif llm_ev["type"] == "error":
+                    yield {"type": "error", "message": llm_ev["message"]}
+                    return
+            if not choice:
+                yield {"type": "error", "message": "No response from LLM"}
                 return
-            choice = response["choices"][0]
-            finish = choice.get("finish_reason", "stop")
 
         if finish != "tool_calls":
             content = (choice.get("message", {}).get("content") or "").strip().replace("\U0001F99E", "")
@@ -858,6 +908,98 @@ def chat_with_tools_stream(request_body: dict, override_tools: list = None):
     yield {"type": "done", "content": content}
 
 
+def _call_picoclaw_stream(body: dict):
+    """Streaming variant of _call_picoclaw. Yields events:
+    {"type": "content_delta", "text": "..."} — incremental text
+    {"type": "response", "message": {...}, "finish_reason": "..."} — final assembled response
+    {"type": "error", "message": "..."} — error
+    """
+    url, api_key, default_model = _load_llm_config()
+    payload = dict(body)
+    if not payload.get("model") or payload.get("model") == "default":
+        if default_model:
+            payload["model"] = default_model
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    payload["stream"] = True
+    payload["_from_tunnel"] = True
+
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as resp:
+            content_acc = ""
+            reasoning_acc = ""
+            tool_calls_acc = {}  # index → {id, name, arguments_str}
+            finish_reason = "stop"
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                if not line:
+                    continue
+                # Handle both "data: {...}" and "data:{...}" (Kimi omits space)
+                if line.startswith("data:"):
+                    raw_data = line[5:].strip()
+                else:
+                    continue
+                if raw_data == "[DONE]":
+                    break
+                try:
+                    ev = json.loads(raw_data)
+                    # Detect upstream error event (e.g. Kimi 403, cloud errors)
+                    if ev.get("error"):
+                        err = ev["error"]
+                        code = err.get("code", "")
+                        msg = err.get("message", "Unknown upstream error")
+                        yield {"type": "error", "message": f"API error {code}: {msg}" if code else msg}
+                        return
+                    choice = (ev.get("choices") or [{}])[0]
+                    delta = choice.get("delta", {})
+                    fr = choice.get("finish_reason")
+                    if fr:
+                        finish_reason = fr
+                    # Reasoning content (Kimi thinking) — accumulate for round-trip
+                    reasoning = delta.get("reasoning_content")
+                    if reasoning:
+                        reasoning_acc += reasoning
+                    # Text content
+                    text = delta.get("content")
+                    if text:
+                        content_acc += text
+                        yield {"type": "content_delta", "text": text}
+                    # Tool calls (streamed incrementally)
+                    for tc in delta.get("tool_calls", []):
+                        idx = tc.get("index", 0)
+                        if idx not in tool_calls_acc:
+                            tool_calls_acc[idx] = {
+                                "id": tc.get("id", f"call_{idx}"),
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            }
+                        entry = tool_calls_acc[idx]
+                        fn = tc.get("function", {})
+                        if fn.get("name"):
+                            entry["function"]["name"] = fn["name"]
+                        if fn.get("arguments"):
+                            entry["function"]["arguments"] += fn["arguments"]
+                except Exception:
+                    continue
+            # Build final message
+            message = {"role": "assistant", "content": content_acc or None}
+            if reasoning_acc:
+                message["reasoning_content"] = reasoning_acc
+            if tool_calls_acc:
+                message["tool_calls"] = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
+            yield {"type": "response", "message": message, "finish_reason": finish_reason}
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode(errors="replace")
+        log.error("LLM API HTTP %d: %s", e.code, body_text)
+        yield {"type": "error", "message": f"LLM API error {e.code}: {body_text[:200]}"}
+    except Exception as e:
+        log.error("LLM API unreachable: %s", e)
+        yield {"type": "error", "message": f"LLM API unreachable: {e}"}
+
+
 def _call_picoclaw(body: dict) -> dict:
     """POST request_body to the configured LLM API and return parsed JSON response.
 
@@ -925,7 +1067,7 @@ def _execute_builtin(tool_suffix: str, arguments: dict) -> str:
     if tool_suffix == "bash":
         cmd = arguments.get("command", "")
         if not cmd:
-            return "[error] No command provided"
+            return '[error] Missing required argument "command". Call system__bash with: {"command": "your shell command here"}'
         reason = _is_dangerous_command(cmd)
         if reason:
             log.warning("Blocked dangerous bash command: %s — %s", cmd[:80], reason)
@@ -944,8 +1086,8 @@ def _execute_builtin(tool_suffix: str, arguments: dict) -> str:
 
     if tool_suffix == "python":
         code = arguments.get("code", "")
-        if not code:
-            return "[error] No code provided"
+        if not code or not code.strip():
+            return '[error] Missing required argument "code". Call system__python with: {"code": "your complete Python script here"}'
         try:
             with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
                 f.write(code)
@@ -964,9 +1106,12 @@ def _execute_builtin(tool_suffix: str, arguments: dict) -> str:
 
     if tool_suffix == "write_file":
         path = arguments.get("path", "")
-        content = arguments.get("content", "")
+        content = arguments.get("content")
         if not path:
-            return "[error] No path provided"
+            return '[error] Missing required argument "path". Call system__write_file with: {"path": "/absolute/path/to/file", "content": "file content here"}'
+        if content is None:
+            return '[error] Missing required argument "content". Call system__write_file with: {"path": "' + path + '", "content": "file content here"}'
+        content = str(content)
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w") as f:
@@ -978,7 +1123,7 @@ def _execute_builtin(tool_suffix: str, arguments: dict) -> str:
     if tool_suffix == "read_file":
         path = arguments.get("path", "")
         if not path:
-            return "[error] No path provided"
+            return '[error] Missing required argument "path". Call system__read_file with: {"path": "/absolute/path/to/file"}'
         try:
             with open(path) as f:
                 content = f.read()
@@ -1036,7 +1181,8 @@ def _execute_builtin(tool_suffix: str, arguments: dict) -> str:
 
         def _run_agent_task(agent_id: str, task_text: str):
             if agent_id not in agents:
-                errors[agent_id] = f"Agent '{agent_id}' not found"
+                available = ", ".join(agents.keys()) or "none configured"
+                errors[agent_id] = f"Agent '{agent_id}' not found. Valid agent IDs: {available}"
                 return
             body = {"messages": [{"role": "user", "content": task_text}]}
             text_parts = []
@@ -1165,48 +1311,81 @@ def _execute_builtin(tool_suffix: str, arguments: dict) -> str:
 
 
 def _web_search(query: str, max_results: int = 5) -> str:
-    """Search DuckDuckGo HTML and extract results. Pure stdlib, no pip."""
+    """Search the web using Bing (primary) or DuckDuckGo (fallback). Pure stdlib."""
     import html as html_mod
     import re
 
     encoded = urllib.request.quote(query)
-    url = f"https://html.duckduckgo.com/html/?q={encoded}"
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (X11; Linux armv7l) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    })
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        body = resp.read().decode("utf-8", errors="replace")
+    ua = "Mozilla/5.0 (X11; Linux armv7l) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-    results = []
-    # DuckDuckGo HTML results are in <a class="result__a" ...> blocks
-    # and snippets in <a class="result__snippet" ...> blocks
-    links = re.findall(
-        r'<a\s+rel="nofollow"\s+class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
-        body, re.DOTALL,
-    )
-    snippets = re.findall(
-        r'<a\s+class="result__snippet"[^>]*>(.*?)</a>',
-        body, re.DOTALL,
-    )
+    def _parse_bing(body):
+        results = []
+        # Bing: <h2><a href="...">title</a></h2> inside .b_algo blocks
+        blocks = re.findall(r'<li class="b_algo".*?</li>', body, re.DOTALL)
+        if not blocks:
+            # fallback pattern
+            blocks = re.findall(r'<h2>.*?<p[^>]*>.*?</p>', body, re.DOTALL)
+        for block in blocks[:max_results]:
+            title_m = re.search(r'<h2[^>]*>.*?<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', block, re.DOTALL)
+            if not title_m:
+                continue
+            url = title_m.group(1)
+            title = re.sub(r"<[^>]+>", "", title_m.group(2)).strip()
+            title = html_mod.unescape(title)
+            snip_m = re.search(r'<p[^>]*>(.*?)</p>', block, re.DOTALL)
+            snippet = html_mod.unescape(re.sub(r"<[^>]+>", "", snip_m.group(1)).strip()) if snip_m else ""
+            results.append(f"{len(results)+1}. {title}\n   {url}\n   {snippet}")
+        return results
 
-    for i, (href, title_html) in enumerate(links[:max_results]):
-        title = re.sub(r"<[^>]+>", "", title_html).strip()
-        title = html_mod.unescape(title)
-        snippet = ""
-        if i < len(snippets):
-            snippet = re.sub(r"<[^>]+>", "", snippets[i]).strip()
-            snippet = html_mod.unescape(snippet)
-        # DuckDuckGo wraps URLs in a redirect; extract the real URL
-        real_url = href
-        if "uddg=" in href:
-            match = re.search(r"uddg=([^&]+)", href)
-            if match:
-                real_url = urllib.request.unquote(match.group(1))
-        results.append(f"{i+1}. {title}\n   {real_url}\n   {snippet}")
+    def _parse_ddg(body):
+        results = []
+        links = re.findall(
+            r'<a\s+rel="nofollow"\s+class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
+            body, re.DOTALL)
+        snippets = re.findall(r'<a\s+class="result__snippet"[^>]*>(.*?)</a>', body, re.DOTALL)
+        for i, (href, title_html) in enumerate(links[:max_results]):
+            title = html_mod.unescape(re.sub(r"<[^>]+>", "", title_html).strip())
+            snippet = html_mod.unescape(re.sub(r"<[^>]+>", "", snippets[i]).strip()) if i < len(snippets) else ""
+            real_url = href
+            if "uddg=" in href:
+                m = re.search(r"uddg=([^&]+)", href)
+                if m:
+                    real_url = urllib.request.unquote(m.group(1))
+            results.append(f"{i+1}. {title}\n   {real_url}\n   {snippet}")
+        return results
 
-    if not results:
-        return f"No results found for: {query}"
-    return f"Search results for: {query}\n\n" + "\n\n".join(results)
+    engine = _load_core_prompts().get("search_engine", "auto")
+
+    providers = []
+    if engine == "bing":
+        providers = ["bing"]
+    elif engine == "duckduckgo":
+        providers = ["duckduckgo"]
+    else:  # auto — try Bing first, fallback DDG
+        providers = ["bing", "duckduckgo"]
+
+    for provider in providers:
+        try:
+            if provider == "bing":
+                req = urllib.request.Request(
+                    f"https://www.bing.com/search?q={encoded}&setlang=fr",
+                    headers={"User-Agent": ua, "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    body = resp.read().decode("utf-8", errors="replace")
+                results = _parse_bing(body)
+            else:
+                req = urllib.request.Request(
+                    f"https://html.duckduckgo.com/html/?q={encoded}",
+                    headers={"User-Agent": ua})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    body = resp.read().decode("utf-8", errors="replace")
+                results = _parse_ddg(body)
+            if results:
+                return f"Search results for: {query}\n\n" + "\n\n".join(results)
+        except Exception as e:
+            log.warning("%s search failed: %s", provider, e)
+
+    return f"No results found for: {query}"
 
 
 def _execute_tool(tool_name: str, arguments_raw: str) -> str:
