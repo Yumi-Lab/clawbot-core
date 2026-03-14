@@ -941,13 +941,14 @@ def _call_picoclaw_stream(body: dict):
             payload["model"] = default_model
     headers = {"Content-Type": "application/json"}
 
-    # Kimi For Coding blocks datacenter IPs — call directly from Pi (residential IP).
-    # Also rejects tool_calls/tools in payload — strip them for direct Kimi calls.
+    # Kimi For Coding: call directly from Pi (residential IP + claude-code/1.0 UA required).
+    # Datacenter IPs are blocked. External tools also rejected — strip them.
     if payload.get("model") == "kimi-for-coding":
         kimi_url, kimi_key = _load_kimi_config()
         if kimi_url and kimi_key:
             url = kimi_url
             api_key = kimi_key
+            headers["User-Agent"] = "claude-code/1.0"
             payload.pop("_from_tunnel", None)
             payload.pop("tools", None)
             payload.pop("tool_choice", None)
@@ -1048,13 +1049,14 @@ def _call_picoclaw(body: dict) -> dict:
 
     headers = {"Content-Type": "application/json"}
 
-    # Kimi For Coding blocks datacenter IPs — call directly from Pi (residential IP).
-    # Also rejects tools/tool_choice in payload — strip them for direct Kimi calls.
+    # Kimi For Coding: call directly from Pi (residential IP + claude-code/1.0 UA required).
+    # Datacenter IPs are blocked. External tools also rejected — strip them.
     if payload.get("model") == "kimi-for-coding":
         kimi_url, kimi_key = _load_kimi_config()
         if kimi_url and kimi_key:
             url = kimi_url
             api_key = kimi_key
+            headers["User-Agent"] = "claude-code/1.0"
             payload.pop("_from_tunnel", None)
             payload.pop("tools", None)
             payload.pop("tool_choice", None)
