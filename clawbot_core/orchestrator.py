@@ -651,7 +651,7 @@ def chat_with_tools(request_body: dict, override_tools: list = None) -> dict:
             body["messages"] = _compact_messages(body["messages"])
 
         log.info("Tool loop round %d/%d", round_num + 1, MAX_TOOL_ROUNDS)
-        response = _call_picoclaw(body)
+        response = _call_llm(body)
 
         if not response.get("choices"):
             return response
@@ -709,7 +709,7 @@ def chat_with_tools(request_body: dict, override_tools: list = None) -> dict:
     log.warning("Reached max tool rounds (%d), forcing final response", MAX_TOOL_ROUNDS)
     body.pop("tools", None)
     body.pop("tool_choice", None)
-    return _call_picoclaw(body)
+    return _call_llm(body)
 
 
 def chat_with_tools_stream(request_body: dict, override_tools: list = None, session_id: str = None):
@@ -825,7 +825,7 @@ def chat_with_tools_stream(request_body: dict, override_tools: list = None, sess
             # Stream from cloud (OpenAI-compatible) — real-time token output for Kimi etc.
             choice = None
             finish = "stop"
-            for llm_ev in _call_picoclaw_stream(body):
+            for llm_ev in _call_llm_stream(body):
                 if llm_ev["type"] == "content_delta":
                     yield {"type": "content_delta", "text": llm_ev["text"]}
                 elif llm_ev["type"] == "thinking_delta":
@@ -921,15 +921,15 @@ def chat_with_tools_stream(request_body: dict, override_tools: list = None, sess
         "role": "user",
         "content": "[System: You have reached the maximum number of tool calls. Summarize what you have done and what was accomplished. If the task is incomplete, explain what remains and why.]"
     })
-    response = _call_picoclaw(body)
+    response = _call_llm(body)
     content = (response.get("choices", [{}])[0].get("message", {}).get("content") or "").strip().replace("\U0001F99E", "")
     if not content:
         content = "Task completed. Maximum tool rounds reached."
     yield {"type": "done", "content": content}
 
 
-def _call_picoclaw_stream(body: dict):
-    """Streaming variant of _call_picoclaw. Yields events:
+def _call_llm_stream(body: dict):
+    """Streaming variant of _call_llm. Yields events:
     {"type": "content_delta", "text": "..."} — incremental text
     {"type": "response", "message": {...}, "finish_reason": "..."} — final assembled response
     {"type": "error", "message": "..."} — error
@@ -941,23 +941,10 @@ def _call_picoclaw_stream(body: dict):
             payload["model"] = default_model
     headers = {"Content-Type": "application/json"}
 
-    # Kimi For Coding: call directly from Pi (residential IP + claude-code/1.0 UA required).
-    # Datacenter IPs are blocked. External tools also rejected — strip them.
-    if payload.get("model") == "kimi-for-coding":
-        kimi_url, kimi_key = _load_kimi_config()
-        if kimi_url and kimi_key:
-            url = kimi_url
-            api_key = kimi_key
-            headers["User-Agent"] = "claude-code/1.0"
-            payload.pop("_from_tunnel", None)
-            payload.pop("tools", None)
-            payload.pop("tool_choice", None)
-
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     payload["stream"] = True
-    if "kimi.com" not in url:
-        payload["_from_tunnel"] = True
+    payload["_from_tunnel"] = True
 
     data = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
@@ -1034,12 +1021,8 @@ def _call_picoclaw_stream(body: dict):
         yield {"type": "error", "message": f"LLM API unreachable: {e}"}
 
 
-def _call_picoclaw(body: dict) -> dict:
-    """POST request_body to the configured LLM API and return parsed JSON response.
-
-    PicoClaw proxies to Anthropic synchronously (non-streaming) and sends the full
-    response in one shot. LLM_TIMEOUT is set high enough to cover any generation.
-    """
+def _call_llm(body: dict) -> dict:
+    """POST request_body to the configured LLM API and return parsed JSON response."""
     url, api_key, default_model = _load_llm_config()
 
     payload = dict(body)
@@ -1049,29 +1032,11 @@ def _call_picoclaw(body: dict) -> dict:
 
     headers = {"Content-Type": "application/json"}
 
-    # Kimi For Coding: call directly from Pi (residential IP + claude-code/1.0 UA required).
-    # Datacenter IPs are blocked. External tools also rejected — strip them.
-    if payload.get("model") == "kimi-for-coding":
-        kimi_url, kimi_key = _load_kimi_config()
-        if kimi_url and kimi_key:
-            url = kimi_url
-            api_key = kimi_key
-            headers["User-Agent"] = "claude-code/1.0"
-            payload.pop("_from_tunnel", None)
-            payload.pop("tools", None)
-            payload.pop("tool_choice", None)
-
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
     payload["stream"] = False
-    if "kimi.com" not in url:
-        # Prevent cloud from routing this back to the device via WebSocket tunnel.
-        # Without this flag, cloud sees the device online and forwards the request back,
-        # creating a second orchestrator instance that handles the tool loop silently.
-        # With this flag, cloud calls Anthropic directly and returns finish_reason: "tool_calls"
-        # so THIS orchestrator instance handles the tool loop and emits tool_call/tool_result SSE events.
-        payload["_from_tunnel"] = True
+    payload["_from_tunnel"] = True
 
     data = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")

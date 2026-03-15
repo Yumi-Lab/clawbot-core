@@ -49,6 +49,7 @@ from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, unquote, parse_qs
 
 SESSIONS_DIR = "/home/pi/.clawbot/sessions"
+SESSIONS_TRASH_DIR = "/home/pi/.clawbot/sessions_trash"
 
 
 def _save_assistant_to_session(session_id, content):
@@ -472,6 +473,23 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
 
+        elif path == "/core/sessions/trash":
+            try:
+                os.makedirs(SESSIONS_TRASH_DIR, exist_ok=True)
+                trash = []
+                for fname in sorted(os.listdir(SESSIONS_TRASH_DIR), reverse=True):
+                    if not fname.endswith(".json"):
+                        continue
+                    try:
+                        with open(os.path.join(SESSIONS_TRASH_DIR, fname)) as f:
+                            s = json.load(f)
+                        trash.append({k: s[k] for k in ("id","name","mode","createdAt","updatedAt") if k in s})
+                    except Exception:
+                        pass
+                self.send_json(200, {"sessions": trash})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
         elif path.startswith("/core/sessions/"):
             sid = path[len("/core/sessions/"):]
             if ".." in sid or "/" in sid:
@@ -634,8 +652,30 @@ class Handler(BaseHTTPRequestHandler):
 
         path = urlparse(self.path).path.rstrip("/")
 
+        # Cancel a running session task
+        if path == "/v1/cancel":
+            from orchestrator import cancel_session
+            sid = data.get("session_id", "")
+            if sid:
+                cancel_session(sid)
+                log.info("Cancel requested for session %s", sid)
+                self.send_json(200, {"ok": True, "cancelled": sid})
+            else:
+                self.send_json(400, {"error": "session_id required"})
+            return
+
         # Session create/update
-        if path.startswith("/core/sessions/"):
+        if path.startswith("/core/sessions/trash/"):
+            sid = path[len("/core/sessions/trash/"):]
+            if ".." in sid or "/" in sid:
+                self.send_json(400, {"error": "invalid id"})
+                return
+            src = os.path.join(SESSIONS_TRASH_DIR, sid + ".json")
+            if os.path.isfile(src):
+                os.makedirs(SESSIONS_DIR, exist_ok=True)
+                os.rename(src, os.path.join(SESSIONS_DIR, sid + ".json"))
+            self.send_json(200, {"ok": True})
+        elif path.startswith("/core/sessions/"):
             sid = path[len("/core/sessions/"):]
             if ".." in sid or "/" in sid:
                 self.send_json(400, {"error": "invalid id"})
@@ -768,6 +808,7 @@ class Handler(BaseHTTPRequestHandler):
                         "system_prompt": data.get("system_prompt", ""),
                         "extra_rules": data.get("extra_rules", ""),
                         "twins_reviewer_prompt": data.get("twins_reviewer_prompt", ""),
+                        "search_engine": data.get("search_engine", "auto"),
                     }, f, indent=2)
                 self.send_json(200, {"ok": True})
             except Exception as e:
@@ -899,6 +940,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/chat/completions":
             stream = data.get("stream", False)
             session_id = data.get("session_id")
+            # Clear any stale cancel flag — user is submitting a new message
+            if session_id:
+                from orchestrator import clear_cancelled
+                clear_cancelled(session_id)
             if stream:
                 try:
                     from orchestrator import chat_with_tools_stream
@@ -908,7 +953,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_header("Access-Control-Allow-Origin", "*")
                     self.send_header("X-Accel-Buffering", "no")  # disable nginx buffering
                     self.end_headers()
-                    gen = chat_with_tools_stream(data)
+                    gen = chat_with_tools_stream(data, session_id=session_id)
                     final_content = None
                     try:
                         for event_dict in gen:
@@ -936,12 +981,23 @@ class Handler(BaseHTTPRequestHandler):
                                 self.wfile.write(f"data: {openai_delta}\n\n".encode())
                                 self.wfile.flush()
                     except BrokenPipeError:
-                        # Client disconnected — continue processing in background
+                        # Client disconnected — continue processing in background unless cancelled
                         log.info("Client disconnected, continuing in background (session=%s)", session_id)
                         def _drain():
+                            from orchestrator import is_cancelled, clear_cancelled
+                            if is_cancelled(session_id):
+                                clear_cancelled(session_id)
+                                log.info("Session %s cancelled — skipping background drain", session_id)
+                                _save_assistant_to_session(session_id, "⛔ Tâche arrêtée par l'utilisateur.")
+                                return
                             content = final_content or ""
                             try:
                                 for ev in gen:
+                                    if is_cancelled(session_id):
+                                        clear_cancelled(session_id)
+                                        log.info("Session %s cancelled mid-drain", session_id)
+                                        _save_assistant_to_session(session_id, "⛔ Tâche arrêtée par l'utilisateur.")
+                                        return
                                     if ev.get("type") == "done":
                                         content = ev.get("content", "")
                             except Exception as ex:
@@ -1177,14 +1233,33 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = urlparse(self.path).path.rstrip("/")
-        if path.startswith("/core/sessions/"):
+        if path == "/core/sessions/trash":
+            try:
+                if os.path.isdir(SESSIONS_TRASH_DIR):
+                    for fn in os.listdir(SESSIONS_TRASH_DIR):
+                        if fn.endswith(".json"):
+                            os.remove(os.path.join(SESSIONS_TRASH_DIR, fn))
+            except Exception:
+                pass
+            self.send_json(200, {"ok": True})
+        elif path.startswith("/core/sessions/trash/"):
+            sid = path[len("/core/sessions/trash/"):]
+            if ".." in sid or "/" in sid:
+                self.send_json(400, {"error": "invalid id"})
+                return
+            fpath = os.path.join(SESSIONS_TRASH_DIR, sid + ".json")
+            if os.path.isfile(fpath):
+                os.remove(fpath)
+            self.send_json(200, {"ok": True})
+        elif path.startswith("/core/sessions/"):
             sid = path[len("/core/sessions/"):]
             if ".." in sid or "/" in sid:
                 self.send_json(400, {"error": "invalid id"})
                 return
             fpath = os.path.join(SESSIONS_DIR, sid + ".json")
             if os.path.isfile(fpath):
-                os.remove(fpath)
+                os.makedirs(SESSIONS_TRASH_DIR, exist_ok=True)
+                os.rename(fpath, os.path.join(SESSIONS_TRASH_DIR, sid + ".json"))
             self.send_json(200, {"ok": True})
         elif path.startswith("/core/agents/"):
             from orchestrator import delete_agent
