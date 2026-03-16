@@ -269,6 +269,33 @@ BUILTIN_TOOLS = [
             },
         },
     },
+    # ── FILES module ────────────────────────────────────────────────────────
+    {"type": "function", "function": {"name": "files__read", "description": "Read the content of a file on the Pi filesystem.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute path of the file to read"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "files__write", "description": "Write content to a file atomically (write .tmp then rename). Creates parent directories if needed.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute path of the file to write"}, "content": {"type": "string", "description": "Content to write"}, "force": {"type": "boolean", "description": "Allow writing to system paths like /etc/ (default false)", "default": False}}, "required": ["path", "content"]}}},
+    {"type": "function", "function": {"name": "files__list", "description": "List files and directories at a given path with size and modification time.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Directory path to list"}, "recursive": {"type": "boolean", "description": "List recursively (default false)", "default": False}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "files__move", "description": "Move or rename a file or directory.", "parameters": {"type": "object", "properties": {"src": {"type": "string", "description": "Source path"}, "dst": {"type": "string", "description": "Destination path"}}, "required": ["src", "dst"]}}},
+    {"type": "function", "function": {"name": "files__delete", "description": "Delete a file or empty directory.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Path to delete"}, "recursive": {"type": "boolean", "description": "Delete directory recursively (default false)", "default": False}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "files__dir_create", "description": "Create a directory and all parent directories.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Directory path to create"}}, "required": ["path"]}}},
+    # ── DOCUMENTS module ─────────────────────────────────────────────────────
+    {"type": "function", "function": {"name": "documents__pdf_to_text", "description": "Extract plain text from a PDF file using pdftotext (poppler).", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute path to the PDF file"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "documents__csv_parse", "description": "Parse a CSV file and return its content as a JSON array of objects.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute path to the CSV file"}, "delimiter": {"type": "string", "description": "Field delimiter (default ',')", "default": ","}, "max_rows": {"type": "integer", "description": "Maximum rows to return (default 100)", "default": 100}}, "required": ["path"]}}},
+    # ── WEB module ───────────────────────────────────────────────────────────
+    {"type": "function", "function": {"name": "web__search", "description": "Search the web using Bing/DuckDuckGo and return top results with titles, URLs, and snippets.", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Search query"}, "max_results": {"type": "integer", "description": "Max results (default 5, max 10)", "default": 5}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "web__http_get", "description": "Perform an HTTP GET request and return the response body.", "parameters": {"type": "object", "properties": {"url": {"type": "string", "description": "Target URL"}, "headers": {"type": "object", "description": "Optional HTTP headers as key-value pairs"}, "timeout": {"type": "integer", "description": "Timeout in seconds (default 30)", "default": 30}}, "required": ["url"]}}},
+    {"type": "function", "function": {"name": "web__http_post", "description": "Perform an HTTP POST request with a JSON body and return the response.", "parameters": {"type": "object", "properties": {"url": {"type": "string", "description": "Target URL"}, "body": {"type": "object", "description": "JSON body to send"}, "headers": {"type": "object", "description": "Optional HTTP headers"}, "timeout": {"type": "integer", "description": "Timeout in seconds (default 30)", "default": 30}}, "required": ["url", "body"]}}},
+    {"type": "function", "function": {"name": "web__file_download", "description": "Download a file from a URL and save it to the Pi filesystem.", "parameters": {"type": "object", "properties": {"url": {"type": "string", "description": "URL to download"}, "dest": {"type": "string", "description": "Absolute destination path on the Pi"}, "timeout": {"type": "integer", "description": "Timeout in seconds (default 60)", "default": 60}}, "required": ["url", "dest"]}}},
+    # ── EXEC module ──────────────────────────────────────────────────────────
+    {"type": "function", "function": {"name": "exec__run_python", "description": "Execute a Python script in a sandboxed environment. Working directory: /tmp/clawbot-agent/. Use for agent-authored scripts that should not run as root.", "parameters": {"type": "object", "properties": {"code": {"type": "string", "description": "Complete Python script to execute"}, "timeout": {"type": "integer", "description": "Timeout in seconds (default 60)", "default": 60}}, "required": ["code"]}}},
+    {"type": "function", "function": {"name": "exec__run_bash", "description": "Execute a bash script in a sandboxed environment. Working directory: /tmp/clawbot-agent/. Use for agent-authored scripts that should not run as root.", "parameters": {"type": "object", "properties": {"script": {"type": "string", "description": "Bash script to execute"}, "timeout": {"type": "integer", "description": "Timeout in seconds (default 60)", "default": 60}}, "required": ["script"]}}},
+    # ── EMAIL module ─────────────────────────────────────────────────────────
+    {"type": "function", "function": {"name": "email__send", "description": "Send an email via SMTP. Config must be set in /home/pi/.clawbot/email.json (smtp_host, smtp_port, user, password, from_name).", "parameters": {"type": "object", "properties": {"to": {"type": "string", "description": "Recipient email address"}, "subject": {"type": "string", "description": "Email subject"}, "body": {"type": "string", "description": "Email body (plain text)"}, "cc": {"type": "string", "description": "Optional CC address"}}, "required": ["to", "subject", "body"]}}},
+    # ── GIT module ───────────────────────────────────────────────────────────
+    {"type": "function", "function": {"name": "git__status", "description": "Get the git status of a repository: current branch, staged and unstaged changes.", "parameters": {"type": "object", "properties": {"repo_path": {"type": "string", "description": "Absolute path to the git repository"}}, "required": ["repo_path"]}}},
+    {"type": "function", "function": {"name": "git__commit", "description": "Stage all changes (git add -A) and create a commit in a git repository.", "parameters": {"type": "object", "properties": {"repo_path": {"type": "string", "description": "Absolute path to the git repository"}, "message": {"type": "string", "description": "Commit message"}}, "required": ["repo_path", "message"]}}},
+    {"type": "function", "function": {"name": "git__push", "description": "Push commits to the remote repository. Optionally set remote and branch.", "parameters": {"type": "object", "properties": {"repo_path": {"type": "string", "description": "Absolute path to the git repository"}, "remote": {"type": "string", "description": "Remote name (default 'origin')", "default": "origin"}, "branch": {"type": "string", "description": "Branch name (default: current branch)"}}, "required": ["repo_path"]}}},
+    # ── SYSTEM extended module ───────────────────────────────────────────────
+    {"type": "function", "function": {"name": "system__get_system_info", "description": "Get system information about the Pi: CPU usage, RAM, disk, temperature, hostname, IP addresses.", "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "system__ssh_execute", "description": "Execute a command on a remote server via SSH with password authentication.", "parameters": {"type": "object", "properties": {"host": {"type": "string"}, "user": {"type": "string"}, "password": {"type": "string"}, "command": {"type": "string"}, "port": {"type": "integer", "default": 22}, "timeout": {"type": "integer", "default": 30}}, "required": ["host", "user", "password", "command"]}}},
 ]
 
 # Context compaction — triggered when estimated input tokens exceed threshold
@@ -1320,6 +1347,64 @@ def _execute_builtin(tool_suffix: str, arguments: dict) -> str:
         result = "".join(result_parts).strip() or "(no response)"
         return f"[Handoff → {agent_name}]\n{result}"
 
+    if tool_suffix == "get_system_info":
+        try:
+            import socket
+            lines = []
+            # Hostname
+            lines.append(f"hostname: {socket.gethostname()}")
+            # CPU usage
+            try:
+                with open("/proc/stat") as f:
+                    cpu = f.readline().split()
+                idle = int(cpu[4])
+                total = sum(int(x) for x in cpu[1:])
+                lines.append(f"cpu_usage: {round(100 * (1 - idle / total), 1)}%")
+            except Exception:
+                pass
+            # RAM
+            try:
+                with open("/proc/meminfo") as f:
+                    mem = {k.strip(): v.strip() for k, v in (l.split(":", 1) for l in f if ":" in l)}
+                total_kb = int(mem.get("MemTotal", "0 kB").split()[0])
+                avail_kb = int(mem.get("MemAvailable", "0 kB").split()[0])
+                used_kb = total_kb - avail_kb
+                lines.append(f"ram_total: {total_kb // 1024} MB")
+                lines.append(f"ram_used: {used_kb // 1024} MB ({round(100 * used_kb / total_kb, 1)}%)")
+            except Exception:
+                pass
+            # Temperature
+            try:
+                with open("/sys/class/thermal/thermal_zone0/temp") as f:
+                    lines.append(f"cpu_temp: {int(f.read().strip()) / 1000:.1f}°C")
+            except Exception:
+                pass
+            # Disk
+            try:
+                r = subprocess.run(["df", "-h", "/"], capture_output=True, text=True, timeout=5)
+                parts = r.stdout.strip().splitlines()
+                if len(parts) > 1:
+                    fields = parts[1].split()
+                    lines.append(f"disk_total: {fields[1]}, disk_used: {fields[2]} ({fields[4]})")
+            except Exception:
+                pass
+            # IPs
+            try:
+                r = subprocess.run(["ip", "-brief", "addr"], capture_output=True, text=True, timeout=5)
+                for line in r.stdout.strip().splitlines():
+                    parts = line.split()
+                    if len(parts) >= 3 and parts[0] != "lo" and parts[2]:
+                        lines.append(f"ip_{parts[0]}: {parts[2]}")
+            except Exception:
+                pass
+            return "\n".join(lines)
+        except Exception as e:
+            return f"[error] {e}"
+
+    if tool_suffix == "ssh_execute":
+        # Alias of system__ssh for new naming
+        return _execute_builtin("ssh", arguments)
+
     return f"[error] Unknown built-in tool: system__{tool_suffix}"
 
 
@@ -1401,6 +1486,405 @@ def _web_search(query: str, max_results: int = 5) -> str:
     return f"No results found for: {query}"
 
 
+EXEC_WORKDIR = "/tmp/clawbot-agent"
+EXEC_USER = "openjarvis-agents"
+_PROTECTED_PATHS = ("/etc/", "/usr/", "/boot/", "/bin/", "/sbin/", "/lib/", "/sys/")
+
+
+def _execute_files_tool(tool_suffix: str, arguments: dict) -> str:
+    """Execute a files module tool."""
+    import shutil as _shutil
+
+    if tool_suffix == "read":
+        path = arguments.get("path", "")
+        if not path:
+            return '[error] Missing "path"'
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            return content or "(empty file)"
+        except Exception as e:
+            return f"[error] {e}"
+
+    if tool_suffix == "write":
+        path = arguments.get("path", "")
+        content = arguments.get("content")
+        force = arguments.get("force", False)
+        if not path:
+            return '[error] Missing "path"'
+        if content is None:
+            return '[error] Missing "content"'
+        content = str(content)
+        if not force and any(path.startswith(p) for p in _PROTECTED_PATHS):
+            return f'[blocked] Path {path!r} is in a protected system directory. Use force=true to override.'
+        try:
+            parent = os.path.dirname(os.path.abspath(path))
+            os.makedirs(parent, exist_ok=True)
+            tmp = path + ".tmp." + str(os.getpid())
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.replace(tmp, path)
+            return f"Written {len(content)} bytes to {path}"
+        except Exception as e:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+            return f"[error] {e}"
+
+    if tool_suffix == "list":
+        path = arguments.get("path", "")
+        recursive = arguments.get("recursive", False)
+        if not path:
+            return '[error] Missing "path"'
+        try:
+            import datetime as _dt
+            lines = []
+            if recursive:
+                for root, dirs, files in os.walk(path):
+                    for name in sorted(dirs):
+                        lines.append(os.path.join(root, name) + "/")
+                    for name in sorted(files):
+                        fp = os.path.join(root, name)
+                        try:
+                            stat = os.stat(fp)
+                            lines.append(f"{fp}  {stat.st_size}B  {_dt.datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M')}")
+                        except Exception:
+                            lines.append(fp)
+            else:
+                for name in sorted(os.listdir(path)):
+                    fp = os.path.join(path, name)
+                    try:
+                        stat = os.stat(fp)
+                        kind = "d" if os.path.isdir(fp) else "f"
+                        lines.append(f"[{kind}] {name}  {stat.st_size}B  {_dt.datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M')}")
+                    except Exception:
+                        lines.append(name)
+            return "\n".join(lines) if lines else "(empty directory)"
+        except Exception as e:
+            return f"[error] {e}"
+
+    if tool_suffix == "move":
+        src = arguments.get("src", "")
+        dst = arguments.get("dst", "")
+        if not src or not dst:
+            return '[error] Missing "src" or "dst"'
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
+            _shutil.move(src, dst)
+            return f"Moved {src} → {dst}"
+        except Exception as e:
+            return f"[error] {e}"
+
+    if tool_suffix == "delete":
+        path = arguments.get("path", "")
+        recursive = arguments.get("recursive", False)
+        if not path:
+            return '[error] Missing "path"'
+        if any(path.rstrip("/") == p.rstrip("/") for p in _PROTECTED_PATHS):
+            return f"[blocked] Refusing to delete protected path: {path}"
+        try:
+            if os.path.isdir(path):
+                if recursive:
+                    _shutil.rmtree(path)
+                    return f"Deleted directory {path} recursively"
+                else:
+                    os.rmdir(path)
+                    return f"Deleted empty directory {path}"
+            else:
+                os.unlink(path)
+                return f"Deleted {path}"
+        except Exception as e:
+            return f"[error] {e}"
+
+    if tool_suffix == "dir_create":
+        path = arguments.get("path", "")
+        if not path:
+            return '[error] Missing "path"'
+        try:
+            os.makedirs(path, exist_ok=True)
+            return f"Created directory {path}"
+        except Exception as e:
+            return f"[error] {e}"
+
+    return f"[error] Unknown files tool: files__{tool_suffix}"
+
+
+def _execute_documents_tool(tool_suffix: str, arguments: dict) -> str:
+    """Execute a documents module tool."""
+    if tool_suffix == "pdf_to_text":
+        path = arguments.get("path", "")
+        if not path:
+            return '[error] Missing "path"'
+        try:
+            result = subprocess.run(
+                ["pdftotext", path, "-"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                return f"[error] pdftotext failed: {result.stderr.strip()}"
+            return result.stdout.strip() or "(no text extracted)"
+        except FileNotFoundError:
+            return "[error] pdftotext not found — install with: apt-get install poppler-utils"
+        except Exception as e:
+            return f"[error] {e}"
+
+    if tool_suffix == "csv_parse":
+        import csv as _csv
+        path = arguments.get("path", "")
+        delimiter = arguments.get("delimiter", ",")
+        max_rows = int(arguments.get("max_rows", 100))
+        if not path:
+            return '[error] Missing "path"'
+        try:
+            rows = []
+            with open(path, encoding="utf-8", errors="replace", newline="") as f:
+                reader = _csv.DictReader(f, delimiter=delimiter)
+                for i, row in enumerate(reader):
+                    if i >= max_rows:
+                        break
+                    rows.append(dict(row))
+            return json.dumps(rows, ensure_ascii=False)
+        except Exception as e:
+            return f"[error] {e}"
+
+    return f"[error] Unknown documents tool: documents__{tool_suffix}"
+
+
+def _execute_web_tool(tool_suffix: str, arguments: dict) -> str:
+    """Execute a web module tool."""
+    if tool_suffix == "search":
+        query = arguments.get("query", "")
+        max_results = min(int(arguments.get("max_results", 5)), 10)
+        if not query:
+            return "[error] No query provided"
+        try:
+            return _web_search(query, max_results)
+        except Exception as e:
+            return f"[error] Web search failed: {e}"
+
+    if tool_suffix == "http_get":
+        url = arguments.get("url", "")
+        headers = arguments.get("headers") or {}
+        timeout = int(arguments.get("timeout", 30))
+        if not url:
+            return '[error] Missing "url"'
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+            return body[:TOOL_RESULT_MAX_CHARS]
+        except Exception as e:
+            return f"[error] {e}"
+
+    if tool_suffix == "http_post":
+        url = arguments.get("url", "")
+        body = arguments.get("body") or {}
+        headers = arguments.get("headers") or {}
+        timeout = int(arguments.get("timeout", 30))
+        if not url:
+            return '[error] Missing "url"'
+        try:
+            data = json.dumps(body).encode()
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json", **headers})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8", errors="replace")[:TOOL_RESULT_MAX_CHARS]
+        except Exception as e:
+            return f"[error] {e}"
+
+    if tool_suffix == "file_download":
+        url = arguments.get("url", "")
+        dest = arguments.get("dest", "")
+        timeout = int(arguments.get("timeout", 60))
+        if not url or not dest:
+            return '[error] Missing "url" or "dest"'
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = resp.read()
+            with open(dest, "wb") as f:
+                f.write(data)
+            return f"Downloaded {len(data)} bytes to {dest}"
+        except Exception as e:
+            return f"[error] {e}"
+
+    return f"[error] Unknown web tool: web__{tool_suffix}"
+
+
+def _execute_exec_tool(tool_suffix: str, arguments: dict) -> str:
+    """Execute an exec module tool (sandboxed via openjarvis-agents user)."""
+    import shutil as _shutil
+
+    os.makedirs(EXEC_WORKDIR, exist_ok=True)
+    # Check if sandbox user exists
+    _use_sandbox = bool(_shutil.which("sudo") and
+                        subprocess.run(["id", EXEC_USER], capture_output=True, timeout=3).returncode == 0)
+
+    timeout = int(arguments.get("timeout", 60))
+
+    if tool_suffix == "run_python":
+        code = arguments.get("code", "")
+        if not code.strip():
+            return '[error] Missing "code"'
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".py", mode="w", dir=EXEC_WORKDIR, delete=False) as f:
+                f.write(code)
+                tmp_path = f.name
+            try:
+                if _use_sandbox:
+                    cmd = ["sudo", "-u", EXEC_USER, "python3", tmp_path]
+                else:
+                    cmd = ["python3", tmp_path]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                                        cwd=EXEC_WORKDIR, env={**os.environ, "HOME": EXEC_WORKDIR})
+                out = result.stdout + result.stderr
+                return out.strip() or "(no output)"
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+        except subprocess.TimeoutExpired:
+            return f"[error] Script timed out after {timeout}s"
+        except Exception as e:
+            return f"[error] {e}"
+
+    if tool_suffix == "run_bash":
+        script = arguments.get("script", "")
+        if not script.strip():
+            return '[error] Missing "script"'
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".sh", mode="w", dir=EXEC_WORKDIR, delete=False) as f:
+                f.write("#!/bin/bash\n" + script)
+                tmp_path = f.name
+            os.chmod(tmp_path, 0o755)
+            try:
+                if _use_sandbox:
+                    cmd = ["sudo", "-u", EXEC_USER, "bash", tmp_path]
+                else:
+                    cmd = ["bash", tmp_path]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                                        cwd=EXEC_WORKDIR, env={**os.environ, "HOME": EXEC_WORKDIR})
+                out = result.stdout + result.stderr
+                return out.strip() or "(no output)"
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+        except subprocess.TimeoutExpired:
+            return f"[error] Script timed out after {timeout}s"
+        except Exception as e:
+            return f"[error] {e}"
+
+    return f"[error] Unknown exec tool: exec__{tool_suffix}"
+
+
+def _execute_email_tool(tool_suffix: str, arguments: dict) -> str:
+    """Execute an email module tool."""
+    if tool_suffix == "send":
+        import smtplib
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+
+        to = arguments.get("to", "")
+        subject = arguments.get("subject", "")
+        body = arguments.get("body", "")
+        cc = arguments.get("cc", "")
+
+        if not to or not subject or not body:
+            return '[error] Missing required fields: to, subject, body'
+
+        email_config_path = "/home/pi/.clawbot/email.json"
+        try:
+            with open(email_config_path) as f:
+                cfg = json.load(f)
+        except Exception as e:
+            return f"[error] Email config not found at {email_config_path}: {e}\nCreate it with: {{\"smtp_host\": \"...\", \"smtp_port\": 587, \"user\": \"...\", \"password\": \"...\", \"from_name\": \"ClawBot\"}}"
+
+        smtp_host = cfg.get("smtp_host", "")
+        smtp_port = int(cfg.get("smtp_port", 587))
+        user = cfg.get("user", "")
+        password = cfg.get("password", "")
+        from_name = cfg.get("from_name", "ClawBot")
+
+        if not smtp_host or not user or not password:
+            return "[error] Incomplete email config (smtp_host, user, password required)"
+
+        try:
+            msg = MIMEMultipart()
+            msg["From"] = f"{from_name} <{user}>"
+            msg["To"] = to
+            msg["Subject"] = subject
+            if cc:
+                msg["Cc"] = cc
+            msg.attach(MIMEText(body, "plain", "utf-8"))
+
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
+                server.ehlo()
+                server.starttls()
+                server.login(user, password)
+                recipients = [to] + ([cc] if cc else [])
+                server.sendmail(user, recipients, msg.as_string())
+
+            return f"Email sent to {to}"
+        except Exception as e:
+            return f"[error] SMTP failed: {e}"
+
+    return f"[error] Unknown email tool: email__{tool_suffix}"
+
+
+def _execute_git_tool(tool_suffix: str, arguments: dict) -> str:
+    """Execute a git module tool."""
+    if tool_suffix == "status":
+        repo_path = arguments.get("repo_path", "")
+        if not repo_path:
+            return '[error] Missing "repo_path"'
+        try:
+            r = subprocess.run(["git", "status", "--short", "-b"], capture_output=True, text=True,
+                               timeout=30, cwd=repo_path)
+            return r.stdout.strip() + (r.stderr.strip() and "\n" + r.stderr.strip() or "")
+        except Exception as e:
+            return f"[error] {e}"
+
+    if tool_suffix == "commit":
+        repo_path = arguments.get("repo_path", "")
+        message = arguments.get("message", "")
+        if not repo_path or not message:
+            return '[error] Missing "repo_path" or "message"'
+        try:
+            add = subprocess.run(["git", "add", "-A"], capture_output=True, text=True, timeout=30, cwd=repo_path)
+            if add.returncode != 0:
+                return f"[error] git add failed: {add.stderr.strip()}"
+            commit = subprocess.run(["git", "commit", "-m", message], capture_output=True, text=True,
+                                    timeout=30, cwd=repo_path)
+            out = commit.stdout.strip() + (commit.stderr.strip() and "\n" + commit.stderr.strip() or "")
+            if commit.returncode != 0:
+                return f"[error] git commit failed: {out}"
+            return out
+        except Exception as e:
+            return f"[error] {e}"
+
+    if tool_suffix == "push":
+        repo_path = arguments.get("repo_path", "")
+        remote = arguments.get("remote", "origin")
+        branch = arguments.get("branch", "")
+        if not repo_path:
+            return '[error] Missing "repo_path"'
+        try:
+            cmd = ["git", "push", remote]
+            if branch:
+                cmd.append(branch)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60, cwd=repo_path)
+            out = result.stdout.strip() + (result.stderr.strip() and "\n" + result.stderr.strip() or "")
+            return out or "Push successful"
+        except Exception as e:
+            return f"[error] {e}"
+
+    return f"[error] Unknown git tool: git__{tool_suffix}"
+
+
 def _execute_tool(tool_name: str, arguments_raw: str) -> str:
     """
     Execute a tool by calling the owning module's HTTP endpoint.
@@ -1418,9 +1902,21 @@ def _execute_tool(tool_name: str, arguments_raw: str) -> str:
     except json.JSONDecodeError:
         arguments = {"raw": arguments_raw}
 
-    # Built-in system tools — executed locally
+    # Built-in tools — executed locally without HTTP
     if module_id == "system":
         return _execute_builtin(tool_suffix, arguments)
+    if module_id == "files":
+        return _execute_files_tool(tool_suffix, arguments)
+    if module_id == "documents":
+        return _execute_documents_tool(tool_suffix, arguments)
+    if module_id == "web":
+        return _execute_web_tool(tool_suffix, arguments)
+    if module_id == "exec":
+        return _execute_exec_tool(tool_suffix, arguments)
+    if module_id == "email":
+        return _execute_email_tool(tool_suffix, arguments)
+    if module_id == "git":
+        return _execute_git_tool(tool_suffix, arguments)
 
     port = _get_module_port(module_id)
     if port is None:
