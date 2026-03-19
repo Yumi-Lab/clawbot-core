@@ -1,0 +1,8 @@
+{
+  "id": "whatsapp-bridge",
+  "name": "WhatsApp Bridge",
+  "version": "1.0.0",
+  "port": 3100,
+  "service": "whatsapp-bridge",
+  "tool_definitions": []
+}

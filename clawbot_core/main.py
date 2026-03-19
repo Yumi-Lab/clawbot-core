@@ -89,6 +89,7 @@ from channels.web import WebChannel as _WebChannel
 from channels.api import APIChannel as _APIChannel
 from channels.telegram import TelegramChannel as _TelegramChannel
 from channels.voice import VoiceChannel as _VoiceChannel
+from channels.whatsapp import WhatsAppChannel as _WhatsAppChannel
 
 def _init_channels():
     """Initialize channel router with default channels."""
@@ -101,9 +102,51 @@ def _init_channels():
         router.register(_TelegramChannel())
     if not router.get_channel("voice"):
         router.register(_VoiceChannel())
+    if not router.get_channel("whatsapp"):
+        router.register(_WhatsAppChannel())
     return router
 
 _channel_router = _init_channels()
+
+# ── WhatsApp bridge process management ────────────────────────────────────────
+
+_WA_BRIDGE_DIR = "/usr/local/lib/clawbot-core/modules/whatsapp-bridge"
+_wa_proc = None
+
+def _wa_start_bridge(allow_from: str = "*"):
+    """Lance le bridge Baileys en background si pas déjà actif."""
+    global _wa_proc
+    if _wa_proc and _wa_proc.poll() is None:
+        log.info("WA bridge already running (pid=%d)", _wa_proc.pid)
+        return
+    bridge_js = os.path.join(_WA_BRIDGE_DIR, "bridge.js")
+    if not os.path.exists(bridge_js):
+        log.error("WA bridge not found at %s", bridge_js)
+        return
+    env = os.environ.copy()
+    env["ALLOW_FROM"] = allow_from
+    env["CORE_URL"] = "http://127.0.0.1:8090"
+    env["AUTH_DIR"] = "/home/pi/.clawbot/wa-auth"
+    try:
+        _wa_proc = subprocess.Popen(
+            ["node", bridge_js],
+            cwd=_WA_BRIDGE_DIR,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        log.info("WA bridge started (pid=%d)", _wa_proc.pid)
+    except Exception as e:
+        log.error("Failed to start WA bridge: %s", e)
+
+def _wa_stop_bridge():
+    """Arrête le bridge Baileys."""
+    global _wa_proc
+    if _wa_proc and _wa_proc.poll() is None:
+        _wa_proc.terminate()
+        log.info("WA bridge stopped")
+    _wa_proc = None
+
 
 PORT = 8090
 
@@ -605,6 +648,14 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
 
+        # ── WhatsApp bridge status proxy ─────────────────────────────────────────
+        elif path == "/v1/whatsapp/status":
+            channel = _channel_router.get_channel("whatsapp")
+            if channel:
+                self.send_json(200, channel.get_bridge_status())
+            else:
+                self.send_json(200, {"connected": False, "status": "unavailable", "phone": None, "qr": None})
+
         # ── OpenAI-compatible model listing (required by Open WebUI, LibreChat, etc.) ──
         elif path == "/v1/models":
             self.send_json(200, {"object": "list", "data": _get_models()})
@@ -851,6 +902,44 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {"ok": True, "cancelled": sid})
             else:
                 self.send_json(400, {"error": "session_id required"})
+            return
+
+        # WhatsApp bridge management
+        if path == "/wa/connect":
+            allow_from = data.get("allow_from", "*")
+            _wa_start_bridge(allow_from)
+            self.send_json(200, {"ok": True})
+            return
+
+        if path == "/wa/disconnect":
+            _wa_stop_bridge()
+            self.send_json(200, {"ok": True})
+            return
+
+        # WhatsApp inbound — called by the Baileys bridge
+        if path == "/v1/channels/whatsapp/inbound":
+            channel = _channel_router.get_channel("whatsapp")
+            if channel:
+                try:
+                    # on_inbound normalizes, filters allow_from, fires LLM reply in background
+                    channel.on_inbound(data)
+                except Exception as e:
+                    log.error("WhatsApp inbound error: %s", e)
+            self.send_json(200, {"ok": True})
+            return
+
+        # WhatsApp logout — clear bridge session and restart
+        if path == "/v1/whatsapp/logout":
+            try:
+                import shutil
+                auth_dir = "/home/pi/.clawbot/wa-auth"
+                if os.path.isdir(auth_dir):
+                    shutil.rmtree(auth_dir)
+                    os.makedirs(auth_dir, exist_ok=True)
+                self.send_json(200, {"ok": True, "message": "Session cleared — rescan QR to reconnect"})
+            except Exception as e:
+                log.error("WhatsApp logout error: %s", e)
+                self.send_json(500, {"error": str(e)})
             return
 
         # Session create/update
