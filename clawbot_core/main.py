@@ -29,7 +29,7 @@ Endpoints:
   POST /core/skills/{id}/disable   — disable skill
   DELETE /core/skills/{id}         — delete skill (builtin skills cannot be deleted)
 
-  POST /v1/chat/completions        — tool-aware chat proxy (→ PicoClaw + module tools)
+  POST /v1/chat/completions        — tool-aware chat proxy (→ ClawBot Core + module tools)
 """
 
 import base64
@@ -74,15 +74,36 @@ def _save_assistant_to_session(session_id, content):
     except Exception as e:
         log.warning("Background session save failed: %s", e)
 
-# Picoclaw agent session compaction
-PICOCLAW_SESSION_FILE = "/home/pi/.picoclaw/workspace/sessions/agent_main_main.json"
-PICOCLAW_CONFIG_FILE = "/home/pi/.picoclaw/config.json"
+AGENT_SESSION_FILE = "/home/pi/.picoclaw/workspace/sessions/agent_main_main.json"
+AGENT_WORKSPACE    = "/home/pi/.picoclaw/workspace"
 AGENT_TOKEN_THRESHOLD = 10000  # estimated tokens before compaction
 AGENT_KEEP_RECENT = 8          # keep last N messages verbatim
 
 from registry import get_all_modules, load_local_modules
 from installer import install, uninstall, enable, disable
 from update_manager import list_updates, do_update
+
+# Channel abstraction layer
+from channels.router import get_router as _get_channel_router
+from channels.web import WebChannel as _WebChannel
+from channels.api import APIChannel as _APIChannel
+from channels.telegram import TelegramChannel as _TelegramChannel
+from channels.voice import VoiceChannel as _VoiceChannel
+
+def _init_channels():
+    """Initialize channel router with default channels."""
+    router = _get_channel_router()
+    if not router.get_channel("web"):
+        router.register(_WebChannel())
+    if not router.get_channel("api"):
+        router.register(_APIChannel())
+    if not router.get_channel("telegram"):
+        router.register(_TelegramChannel())
+    if not router.get_channel("voice"):
+        router.register(_VoiceChannel())
+    return router
+
+_channel_router = _init_channels()
 
 PORT = 8090
 
@@ -98,16 +119,12 @@ _ERR_PAT = re.compile(r"(Error:|Traceback|ModuleNotFoundError|ImportError|exit s
 
 
 def _maybe_compact_agent_session():
-    """
-    If the picoclaw agent session is too large, summarize it via the cloud LLM.
-    Mirrors Claude Code's automatic context compaction.
-    Reads/writes PICOCLAW_SESSION_FILE directly before each picoclaw subprocess call.
-    """
+    """Auto-compact the agent session when it exceeds the token threshold."""
     try:
-        if not os.path.exists(PICOCLAW_SESSION_FILE):
+        if not os.path.exists(AGENT_SESSION_FILE):
             return
 
-        with open(PICOCLAW_SESSION_FILE) as f:
+        with open(AGENT_SESSION_FILE) as f:
             session = json.load(f)
 
         msgs = session.get("messages", [])
@@ -125,14 +142,14 @@ def _maybe_compact_agent_session():
         if len(to_summarize) < 4:
             return  # Not enough old messages to make compaction worthwhile
 
-        # Load LLM config from picoclaw config
+        # Load LLM config from device config (status-api)
         try:
-            with open(PICOCLAW_CONFIG_FILE) as f:
-                cfg = json.load(f)
-            entry = cfg.get("model_list", [{}])[0]
-            base = entry.get("api_base", entry.get("base_url", "")).rstrip("/")
-            api_key = entry.get("api_key", "")
-            model = entry.get("model", "")
+            import urllib.request as _ur
+            with _ur.urlopen("http://127.0.0.1:8089/config", timeout=3) as _r:
+                _dcfg = json.loads(_r.read())
+            base = _dcfg.get("baseurl", "").rstrip("/")
+            api_key = _dcfg.get("apikey", "")
+            model = _dcfg.get("model", "")
             url = f"{base}/chat/completions" if base and api_key else None
         except Exception:
             url = None
@@ -171,7 +188,7 @@ def _maybe_compact_agent_session():
         ] + recent
         session["messages"] = compacted_msgs
 
-        with open(PICOCLAW_SESSION_FILE, "w") as f:
+        with open(AGENT_SESSION_FILE, "w") as f:
             json.dump(session, f)
 
         log.info("Agent session compacted: %d → %d messages (~%d tokens freed)",
@@ -182,7 +199,7 @@ def _maybe_compact_agent_session():
 
 
 def _parse_agent_steps(trace_raw: str, clean_final: str) -> list:
-    """Parse picoclaw raw output into structured step list for UI rendering.
+    """Parse agent raw output into structured step list for UI rendering.
     Each step: {"type": "code"|"error"|"output", "text": str, "n": int}
     """
     steps = []
@@ -229,7 +246,7 @@ def _parse_agent_steps(trace_raw: str, clean_final: str) -> list:
 # ─── API helpers ──────────────────────────────────────────────────────────────
 
 MANAGED_SERVICES = [
-    "clawbot-core", "picoclaw", "nginx",
+    "clawbot-core", "nginx",
     "clawbot-cloud", "clawbot-status-api", "clawbot-telegram",
     "clawbot-kiosk", "wifi-watchdog",
 ]
@@ -239,19 +256,9 @@ def _get_models():
     """Return available models in OpenAI /v1/models list format."""
     models = []
     seen = set()
-    try:
-        with open(PICOCLAW_CONFIG_FILE) as f:
-            cfg = json.load(f)
-        for entry in cfg.get("model_list", []):
-            mid = entry.get("model", "")
-            if mid and mid not in seen:
-                seen.add(mid)
-                models.append({
-                    "id": mid, "object": "model",
-                    "created": 1704067200, "owned_by": "clawbot",
-                })
-    except Exception:
-        pass
+    for mid in ["claude-haiku-4-5-20251001", "claude-sonnet-4-6", "claude-opus-4-6", "kimi-for-coding"]:
+        seen.add(mid)
+        models.append({"id": mid, "object": "model", "created": 1704067200, "owned_by": "clawbot"})
     for mid in ["clawbot", "clawbot-core"]:
         if mid not in seen:
             models.append({"id": mid, "object": "model",
@@ -329,10 +336,11 @@ def _service_control(name, action):
 
 
 def _get_config_raw():
-    """Return (cfg_dict, error_str). Reads picoclaw config file."""
+    """Return (cfg_dict, error_str). Reads device config from status-api."""
     try:
-        with open(PICOCLAW_CONFIG_FILE) as f:
-            return json.load(f), None
+        import urllib.request as _ur
+        with _ur.urlopen("http://127.0.0.1:8089/config", timeout=3) as _r:
+            return json.loads(_r.read()), None
     except Exception as e:
         return None, str(e)
 
@@ -415,7 +423,7 @@ class Handler(BaseHTTPRequestHandler):
             if ".." in filename or filename.startswith("/"):
                 self.send_json(400, {"error": "invalid filename"})
                 return
-            workspace = "/home/pi/.picoclaw/workspace"
+            workspace = AGENT_WORKSPACE
             filepath = os.path.join(workspace, filename)
             if not os.path.isfile(filepath):
                 self.send_json(404, {"error": "file not found"})
@@ -433,7 +441,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
         elif path == "/core/workspace":
-            workspace = "/home/pi/.picoclaw/workspace"
+            workspace = AGENT_WORKSPACE
             qs = parse_qs(urlparse(self.path).query)
             sub = qs.get("path", [""])[0].strip("/")
             target = os.path.normpath(os.path.join(workspace, sub)) if sub else workspace
@@ -542,7 +550,39 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_json(404, {"error": f"Skill '{skill_id}' not found"})
 
+        # ── Search engines ────────────────────────────────────────────────────
+        elif path == "/core/search-engines":
+            from orchestrator import _load_search_engines
+            self.send_json(200, _load_search_engines())
+
+        elif path == "/core/search-engines/scan":
+            _scan_path = "/home/pi/.clawbot/scan-results.json"
+            try:
+                with open(_scan_path) as _sf:
+                    self.send_json(200, json.load(_sf))
+            except FileNotFoundError:
+                self.send_json(200, {"results": [], "model": None, "scanned_at": None})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path == "/core/search-engines/models":
+            # Always return the 4 known ClawBot models (configured via device config)
+            models = [
+                {"model": "claude-haiku-4-5-20251001", "provider": "Anthropic", "group": "Anthropic", "configured": True},
+                {"model": "claude-sonnet-4-6",         "provider": "Anthropic", "group": "Anthropic", "configured": True},
+                {"model": "claude-opus-4-6",           "provider": "Anthropic", "group": "Anthropic", "configured": True},
+                {"model": "kimi-for-coding",           "provider": "Moonshot",  "group": "Moonshot",  "configured": True},
+            ]
+            self.send_json(200, {"models": models, "source": "device-config"})
+
         # ── Core prompts (system prompt + extra rules) ───────────────────────
+        elif path == "/core/region":
+            from orchestrator import _detect_region, _region_cache
+            if "force=1" in self.path:
+                _region_cache["ts"] = 0  # invalidate cache
+            self.send_json(200, {"country_code": _detect_region()})
+            return
+
         elif path == "/core/prompts":
             from orchestrator import DEFAULT_SYSTEM_PROMPT, CORE_PROMPTS_PATH, _TWINS_REVIEWER_PROMPT
             try:
@@ -638,6 +678,35 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
 
+        # ── Connectors: GET /core/connectors, /core/connectors/gdrive/status ──
+        elif path == "/core/connectors":
+            connectors_list = []
+            try:
+                from connectors import CONFIG_PATH as _cfg_path, get_active_connector
+                if os.path.isfile(_cfg_path):
+                    with open(_cfg_path) as f:
+                        _cfg = json.load(f)
+                    if "gdrive" in _cfg:
+                        conn = get_active_connector() if _cfg.get("active") == "gdrive" else None
+                        connectors_list.append({
+                            "id": "gdrive",
+                            "name": "Google Drive",
+                            "active": _cfg.get("active") == "gdrive",
+                            "connected": conn.is_connected() if conn else False,
+                        })
+            except Exception as e:
+                log.warning("Connectors list error: %s", e)
+            self.send_json(200, {"connectors": connectors_list})
+
+        elif path == "/core/connectors/gdrive/status":
+            try:
+                from connectors import get_active_connector
+                conn = get_active_connector()
+                connected = conn.is_connected() if conn else False
+            except Exception:
+                connected = False
+            self.send_json(200, {"connected": connected})
+
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -651,6 +720,126 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         path = urlparse(self.path).path.rstrip("/")
+
+        # Search engine scan & repair
+        if path == "/core/search-engines/scan":
+            from orchestrator import (
+                _load_search_engines, _save_search_engines,
+                _fetch_search_html, _parse_results, _adapt_engine_patterns,
+                _resolve_model_config
+            )
+            import socket as _socket
+
+            # Resolve AI model — allow client override via _resolve_model_config
+            model_override = data.get("model") or None
+            ai_base, ai_key, ai_model = _resolve_model_config(model_override)
+            log.info("[REPAIR] === Search engine repair START === model=%s", ai_model)
+            if not ai_base:
+                ai_model = model_override or "unavailable"
+
+            _orig = _socket.getaddrinfo
+            def _ipv4(host, port, family=0, *a, **kw):
+                return _orig(host, port, _socket.AF_INET, *a, **kw)
+            _socket.getaddrinfo = _ipv4
+            engines = _load_search_engines()
+            filter_engine = data.get("engine")  # single-engine scan if provided
+            report = []
+            try:
+                for name, cfg in engines.items():
+                    if filter_engine and name != filter_engine:
+                        continue
+                    logs = []
+                    entry = {"engine": name, "status": "ok", "adapted": False,
+                             "reliability": cfg.get("reliability", 0.5), "error": None, "logs": logs}
+                    try:
+                        logs.append(f"→ Fetching {cfg.get('url','?').replace('{query}','test+weather+today')[:60]}...")
+                        html_body = _fetch_search_html(cfg, "test weather today")
+                        logs.append(f"  HTML received: {len(html_body)} chars")
+                        results = _parse_results(html_body, cfg.get("patterns", {}), 3)
+                        if results:
+                            cfg["reliability"] = min(1.0, cfg.get("reliability", 0.5) * 0.9 + 0.1)
+                            entry["status"] = "ok"
+                            entry["results_count"] = len(results)
+                            logs.append(f"  ✓ {len(results)} results parsed — patterns OK")
+                        else:
+                            logs.append("  ✗ 0 results with current patterns")
+                            if ai_base:
+                                logs.append(f"  → Calling AI model [{ai_model}] for pattern adaptation...")
+                                new_patterns = _adapt_engine_patterns(name, cfg, html_body,
+                                    model_override=ai_model, base_override=ai_base, key_override=ai_key)
+                                if new_patterns:
+                                    logs.append(f"  AI returned new patterns: {list(new_patterns.keys())}")
+                                    cfg["patterns"] = new_patterns
+                                    engines[name] = cfg
+                                    retry = _parse_results(html_body, new_patterns, 3)
+                                    if retry:
+                                        cfg["reliability"] = min(1.0, cfg.get("reliability", 0.5) * 0.9 + 0.1)
+                                        entry["status"] = "ok"
+                                        entry["adapted"] = True
+                                        entry["results_count"] = len(retry)
+                                        logs.append(f"  ✓ Retry OK — {len(retry)} results with new patterns")
+                                    else:
+                                        cfg["reliability"] = max(0.1, cfg.get("reliability", 0.5) * 0.8)
+                                        entry["status"] = "fail"
+                                        entry["error"] = "0 results even after AI adaptation"
+                                        logs.append("  ✗ New patterns still return 0 results")
+                                else:
+                                    cfg["reliability"] = max(0.1, cfg.get("reliability", 0.5) * 0.8)
+                                    entry["status"] = "fail"
+                                    entry["error"] = "AI adaptation returned nothing"
+                                    logs.append("  ✗ AI returned no patterns (model may be unreachable)")
+                            else:
+                                cfg["reliability"] = max(0.1, cfg.get("reliability", 0.5) * 0.8)
+                                entry["status"] = "fail"
+                                entry["error"] = "No AI model configured — cannot adapt"
+                                logs.append("  ✗ No AI model available (check PicoClaw config)")
+                    except Exception as e:
+                        cfg["reliability"] = max(0.1, cfg.get("reliability", 0.5) * 0.8)
+                        entry["status"] = "error"
+                        entry["error"] = str(e)
+                        logs.append(f"  ✗ Exception: {e}")
+                    entry["reliability"] = round(cfg.get("reliability", 0.5), 2)
+                    engines[name] = cfg
+                    report.append(entry)
+                _save_search_engines(engines)
+                # Persist scan results — merge with previous if single-engine scan
+                import datetime as _dt
+                _scan_path = "/home/pi/.clawbot/scan-results.json"
+                if filter_engine:
+                    # Merge: keep previous results, update only the scanned engine
+                    try:
+                        with open(_scan_path) as _sf:
+                            _prev = json.load(_sf)
+                    except Exception:
+                        _prev = {"model": ai_model, "scanned_at": None, "results": []}
+                    _prev_results = {e["engine"]: e for e in _prev.get("results", [])}
+                    for e in report:
+                        _prev_results[e["engine"]] = e
+                    _scan_payload = {
+                        "model": ai_model,
+                        "scanned_at": _prev.get("scanned_at"),
+                        "last_repair": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "results": list(_prev_results.values()),
+                    }
+                else:
+                    _scan_payload = {
+                        "model": ai_model,
+                        "scanned_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "results": report,
+                    }
+                try:
+                    os.makedirs("/home/pi/.clawbot", exist_ok=True)
+                    with open(_scan_path, "w") as _sf:
+                        json.dump(_scan_payload, _sf)
+                except Exception:
+                    pass
+            finally:
+                _socket.getaddrinfo = _orig
+                repaired = sum(1 for e in report if e.get("adapted"))
+                log.info("[REPAIR] === Search engine repair END === repaired=%d/%d | model=%s",
+                         repaired, len(report), ai_model)
+            self.send_json(200, _scan_payload)
+            return
 
         # Cancel a running session task
         if path == "/v1/cancel":
@@ -694,6 +883,7 @@ class Handler(BaseHTTPRequestHandler):
                 "id": sid,
                 "name": data.get("name", existing.get("name", "New chat")),
                 "mode": data.get("mode", existing.get("mode", "core")),
+                "channel": data.get("channel", existing.get("channel", "web")),
                 "messages": data.get("messages", existing.get("messages", [])),
                 "createdAt": existing.get("createdAt", now),
                 "updatedAt": now,
@@ -809,6 +999,9 @@ class Handler(BaseHTTPRequestHandler):
                         "extra_rules": data.get("extra_rules", ""),
                         "twins_reviewer_prompt": data.get("twins_reviewer_prompt", ""),
                         "search_engine": data.get("search_engine", "auto"),
+                        "search_mode": data.get("search_mode", "auto"),
+                        "brave_api_key": data.get("brave_api_key", ""),
+                        "chat_model": data.get("chat_model", ""),
                     }, f, indent=2)
                 self.send_json(200, {"ok": True})
             except Exception as e:
@@ -839,7 +1032,7 @@ class Handler(BaseHTTPRequestHandler):
                     thinking = json.dumps({"type": "thinking", "message": "Sélection de l'agent..."})
                     self.wfile.write(f"event: thinking\ndata: {thinking}\n\n".encode())
                     self.wfile.flush()
-                matched = route_to_agents(user_msg)
+                matched = route_to_agents(user_msg, last_agent_id=data.get("last_agent_id"))
                 if matched:
                     agent_ids = [a["id"] for a in matched[:1]]
                     # Tell frontend which agent was selected
@@ -936,7 +1129,7 @@ class Handler(BaseHTTPRequestHandler):
                 log.error("agent chat setup error: %s", e)
             return
 
-        # Tool-aware chat proxy
+        # Tool-aware chat proxy — delegated to WebChannel
         if path == "/v1/chat/completions":
             stream = data.get("stream", False)
             session_id = data.get("session_id")
@@ -944,83 +1137,27 @@ class Handler(BaseHTTPRequestHandler):
             if session_id:
                 from orchestrator import clear_cancelled
                 clear_cancelled(session_id)
-            if stream:
+            # Resolve channel (default: web for backward compat)
+            channel_id = data.get("channel", "web")
+            channel = _channel_router.get_channel(channel_id)
+            if not channel:
+                channel = _channel_router.get_channel("web")
+            if stream and hasattr(channel, "handle_stream_request"):
                 try:
-                    from orchestrator import chat_with_tools_stream
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/event-stream")
-                    self.send_header("Cache-Control", "no-cache")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.send_header("X-Accel-Buffering", "no")  # disable nginx buffering
-                    self.end_headers()
-                    gen = chat_with_tools_stream(data, session_id=session_id)
-                    final_content = None
-                    try:
-                        for event_dict in gen:
-                            event_type = event_dict.get("type", "data")
-                            if event_type == "done":
-                                final_content = event_dict.get("content", "")
-                            # Native ClawBot event (named SSE event for dashboard)
-                            chunk = f"event: {event_type}\ndata: {json.dumps(event_dict)}\n\n".encode()
-                            self.wfile.write(chunk)
-                            self.wfile.flush()
-                            # On "done": also emit a standard OpenAI delta chunk
-                            # so Open WebUI / LibreChat / AnythingLLM receive the content
-                            if event_type == "done":
-                                openai_delta = json.dumps({
-                                    "id": "chatcmpl-clawbot",
-                                    "object": "chat.completion.chunk",
-                                    "created": int(time.time()),
-                                    "model": data.get("model", "clawbot"),
-                                    "choices": [{
-                                        "index": 0,
-                                        "delta": {"content": final_content or ""},
-                                        "finish_reason": "stop",
-                                    }],
-                                })
-                                self.wfile.write(f"data: {openai_delta}\n\n".encode())
-                                self.wfile.flush()
-                    except BrokenPipeError:
-                        # Client disconnected — continue processing in background unless cancelled
-                        log.info("Client disconnected, continuing in background (session=%s)", session_id)
-                        def _drain():
-                            from orchestrator import is_cancelled, clear_cancelled
-                            if is_cancelled(session_id):
-                                clear_cancelled(session_id)
-                                log.info("Session %s cancelled — skipping background drain", session_id)
-                                _save_assistant_to_session(session_id, "⛔ Tâche arrêtée par l'utilisateur.")
-                                return
-                            content = final_content or ""
-                            try:
-                                for ev in gen:
-                                    if is_cancelled(session_id):
-                                        clear_cancelled(session_id)
-                                        log.info("Session %s cancelled mid-drain", session_id)
-                                        _save_assistant_to_session(session_id, "⛔ Tâche arrêtée par l'utilisateur.")
-                                        return
-                                    if ev.get("type") == "done":
-                                        content = ev.get("content", "")
-                            except Exception as ex:
-                                log.warning("Background drain error: %s", ex)
-                            _save_assistant_to_session(session_id, content)
-                        threading.Thread(target=_drain, daemon=True).start()
-                        return
-                    except Exception as e:
-                        log.error("chat stream error: %s", e)
-                        try:
-                            err = json.dumps({"type": "error", "message": str(e)})
-                            self.wfile.write(f"event: error\ndata: {err}\n\n".encode())
-                            self.wfile.flush()
-                        except Exception:
-                            pass
-                    try:
-                        self.wfile.write(b"data: [DONE]\n\n")
-                        self.wfile.flush()
-                    except Exception:
-                        pass
+                    channel.handle_stream_request(
+                        self, data, session_id,
+                        save_fn=_save_assistant_to_session,
+                    )
                 except Exception as e:
                     log.error("chat_with_tools_stream setup error: %s", e)
+            elif hasattr(channel, "handle_sync_request"):
+                try:
+                    channel.handle_sync_request(self, data)
+                except Exception as e:
+                    log.error("chat_with_tools error: %s", e)
+                    self.send_json(500, {"error": str(e)})
             else:
+                # Fallback: non-streaming via orchestrator directly
                 try:
                     from orchestrator import chat_with_tools
                     result = chat_with_tools(data)
@@ -1049,7 +1186,7 @@ class Handler(BaseHTTPRequestHandler):
                 env["HOME"] = "/home/pi"
                 # Use Popen + process group so we can kill all child processes on timeout
                 proc = subprocess.Popen(
-                    ["/usr/local/bin/picoclaw", "agent", "--message", msg],
+                    ["/usr/local/bin/picoclaw", "agent", "--message", msg],  # legacy agent binary
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     preexec_fn=os.setsid,
                     env=env,
@@ -1064,12 +1201,12 @@ class Handler(BaseHTTPRequestHandler):
                     except ProcessLookupError:
                         pass
                     proc.wait()
-                    self.send_json(504, {"error": "picoclaw agent timed out"})
+                    self.send_json(504, {"error": "agent timed out"})
                     return
                 # Always parse: extract clean final response + full trace
                 raw = (stdout_text + stderr_text).encode("utf-8", errors="replace")
                 meta = re.search(rb"\{[^}]*final_length=(\d+)[^}]*\}", raw)
-                # picoclaw v0.2.0 emits 🦞 (shrimp U+1F99E) before the final response
+                # Agent binary emits 🦞 (shrimp U+1F99E) before the final response
                 shrimp = "🦞".encode()
                 crab = raw.find(shrimp)
 
@@ -1118,10 +1255,10 @@ class Handler(BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(sse)
                 except BrokenPipeError:
-                    log.info("Client disconnected (picoclaw-agent), saving to session %s", session_id_pc)
+                    log.info("Client disconnected, saving to session %s", session_id_pc)
                     _save_assistant_to_session(session_id_pc, clean)
             except Exception as e:
-                log.error("picoclaw-agent error: %s", e)
+                log.error("agent error: %s", e)
                 self.send_json(500, {"error": str(e)})
             return
 
@@ -1152,13 +1289,19 @@ class Handler(BaseHTTPRequestHandler):
             if "default_model" in data:
                 cfg.setdefault("agents", {}).setdefault("defaults", {})["model"] = data["default_model"]
             try:
-                with open(PICOCLAW_CONFIG_FILE, "w") as f:
-                    json.dump(cfg, f, indent=2)
-                subprocess.run(
-                    ["sudo", "systemctl", "restart", "picoclaw"],
-                    capture_output=True, timeout=5,
-                )
-                self.send_json(200, {"ok": True, "message": "config updated, picoclaw restarting"})
+                import urllib.request as _ur
+                _body = json.dumps({
+                    "provider": cfg.get("provider", "clawbot"),
+                    "model": (cfg.get("model_list") or [{}])[0].get("model", ""),
+                    "api_key": (cfg.get("model_list") or [{}])[0].get("api_key", ""),
+                    "base_url": (cfg.get("model_list") or [{}])[0].get("api_base",
+                        (cfg.get("model_list") or [{}])[0].get("base_url", "")),
+                }).encode()
+                _req = _ur.Request("http://127.0.0.1:8089/config",
+                    data=_body, headers={"Content-Type": "application/json"}, method="POST")
+                with _ur.urlopen(_req, timeout=5):
+                    pass
+                self.send_json(200, {"ok": True, "message": "config updated"})
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
             return
@@ -1172,7 +1315,7 @@ class Handler(BaseHTTPRequestHandler):
             if not filename or ".." in filename or "/" in filename:
                 self.send_json(400, {"error": "invalid filename"})
                 return
-            workspace = "/home/pi/.picoclaw/workspace"
+            workspace = AGENT_WORKSPACE
             os.makedirs(workspace, exist_ok=True)
             fpath = os.path.join(workspace, filename)
             try:
@@ -1227,6 +1370,32 @@ class Handler(BaseHTTPRequestHandler):
 
             else:
                 self.send_json(404, {"error": f"Unknown action '{action}'"})
+        # ── Connector auth: POST /core/connectors/gdrive/auth ───────────────
+        elif path == "/core/connectors/gdrive/auth":
+            code = data.get("code")
+            redirect_uri = data.get("redirect_uri", "urn:ietf:wg:oauth:2.0:oob")
+            if not code:
+                self.send_json(400, {"error": "missing 'code' field"})
+                return
+            try:
+                from connectors import CONNECTORS_DIR as _cd, CONFIG_PATH as _cp, reset_connector
+                from connectors.gdrive import GoogleDriveConnector
+                os.makedirs(_cd, exist_ok=True)
+                GoogleDriveConnector.exchange_code(code, redirect_uri)
+                # Activate gdrive in config
+                cfg = {}
+                if os.path.isfile(_cp):
+                    with open(_cp) as f:
+                        cfg = json.load(f)
+                cfg["active"] = "gdrive"
+                with open(_cp, "w") as f:
+                    json.dump(cfg, f, indent=2)
+                reset_connector()
+                self.send_json(200, {"ok": True, "message": "Google Drive connected"})
+            except Exception as e:
+                log.error("GDrive auth failed: %s", e)
+                self.send_json(500, {"error": str(e)})
+
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -1293,10 +1462,28 @@ class Handler(BaseHTTPRequestHandler):
             if ".." in filename or "/" in filename:
                 self.send_json(400, {"error": "invalid filename"})
                 return
-            fpath = os.path.join("/home/pi/.picoclaw/workspace", filename)
+            fpath = os.path.join(AGENT_WORKSPACE, filename)
             if os.path.isfile(fpath):
                 os.remove(fpath)
             self.send_json(200, {"ok": True})
+        # ── Connector disconnect: DELETE /core/connectors/gdrive/auth ─────────
+        elif path == "/core/connectors/gdrive/auth":
+            try:
+                from connectors import CONFIG_PATH as _cp, reset_connector
+                from connectors.gdrive import TOKEN_PATH
+                if os.path.isfile(TOKEN_PATH):
+                    os.remove(TOKEN_PATH)
+                if os.path.isfile(_cp):
+                    with open(_cp) as f:
+                        cfg = json.load(f)
+                    cfg["active"] = None
+                    with open(_cp, "w") as f:
+                        json.dump(cfg, f, indent=2)
+                reset_connector()
+                self.send_json(200, {"ok": True, "message": "Google Drive disconnected"})
+            except Exception as e:
+                log.error("GDrive disconnect failed: %s", e)
+                self.send_json(500, {"error": str(e)})
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -1318,6 +1505,8 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 if __name__ == "__main__":
     from scheduler import start_scheduler
     start_scheduler()
+    _channel_router.start_all()
+    log.info("Channels started: %s", _channel_router.list_channels())
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     log.info("ClawbotCore listening on http://127.0.0.1:%d", PORT)
     server.serve_forever()
