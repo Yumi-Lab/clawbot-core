@@ -33,6 +33,7 @@ Endpoints:
 """
 
 import base64
+import configparser
 import json
 import logging
 import os
@@ -916,6 +917,24 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"ok": True})
             return
 
+        # WhatsApp allow_from config update
+        if path == "/v1/whatsapp/config":
+            allow = data.get("allow_from", "*").strip()
+            try:
+                cfg_path = "/etc/clawbot/clawbot.cfg"
+                cfg = configparser.ConfigParser()
+                cfg.read(cfg_path)
+                if not cfg.has_section("whatsapp"):
+                    cfg.add_section("whatsapp")
+                cfg.set("whatsapp", "allow_from", allow)
+                with open(cfg_path, "w") as f:
+                    cfg.write(f)
+                self.send_json(200, {"ok": True, "message": "allow_from updated"})
+            except Exception as e:
+                log.error("WhatsApp config error: %s", e)
+                self.send_json(500, {"error": str(e)})
+            return
+
         # WhatsApp inbound — called by the Baileys bridge
         if path == "/v1/channels/whatsapp/inbound":
             channel = _channel_router.get_channel("whatsapp")
@@ -928,7 +947,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"ok": True})
             return
 
-        # WhatsApp logout — clear bridge session and restart
+        # WhatsApp logout — clear bridge session and restart bridge
         if path == "/v1/whatsapp/logout":
             try:
                 import shutil
@@ -936,6 +955,9 @@ class Handler(BaseHTTPRequestHandler):
                 if os.path.isdir(auth_dir):
                     shutil.rmtree(auth_dir)
                     os.makedirs(auth_dir, exist_ok=True)
+                # Restart bridge so it generates a fresh QR
+                _wa_stop_bridge()
+                _wa_start_bridge()
                 self.send_json(200, {"ok": True, "message": "Session cleared — rescan QR to reconnect"})
             except Exception as e:
                 log.error("WhatsApp logout error: %s", e)

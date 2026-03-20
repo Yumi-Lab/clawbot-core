@@ -304,5 +304,81 @@ class TestVoiceChannel(unittest.TestCase):
         self.assertEqual(out.content, "salut")
 
 
+# ── whatsapp.py tests ────────────────────────────────────────────
+
+
+from channels.whatsapp import WhatsAppChannel
+
+
+class TestWhatsAppChannel(unittest.TestCase):
+    def test_channel_id(self):
+        wc = WhatsAppChannel()
+        self.assertEqual(wc.channel_id, "whatsapp")
+
+    def test_capabilities(self):
+        wc = WhatsAppChannel()
+        cap = wc.get_capabilities()
+        self.assertFalse(cap.streaming)
+        self.assertTrue(cap.images)
+        self.assertTrue(cap.audio)
+        self.assertFalse(cap.files)
+        self.assertFalse(cap.groups)
+        self.assertEqual(cap.max_message_length, 4000)
+
+    def test_start_stop_noop(self):
+        wc = WhatsAppChannel()
+        wc.start()
+        wc.stop()
+
+    def test_send_ignores_non_done(self):
+        wc = WhatsAppChannel()
+        # Should not crash on non-done events (no bridge running)
+        wc.send("+33612345678", MessageOut(event_type="thinking", content="hmm"))
+
+    def test_chunk_text(self):
+        wc = WhatsAppChannel()
+        text = "x" * 8001
+        chunks = wc.chunk_text(text)
+        self.assertEqual(len(chunks), 3)
+        self.assertEqual(len(chunks[0]), 4000)
+        self.assertEqual(len(chunks[1]), 4000)
+        self.assertEqual(len(chunks[2]), 1)
+
+    def test_normalize_sender(self):
+        wc = WhatsAppChannel()
+        self.assertEqual(wc.normalize_sender("33612345678"), "+33612345678")
+        self.assertEqual(wc.normalize_sender("+33612345678"), "+33612345678")
+        self.assertEqual(wc.normalize_sender("  +1555123  "), "+1555123")
+
+    def test_is_available_when_bridge_down(self):
+        wc = WhatsAppChannel()
+        # Bridge not running — should return False, not crash
+        self.assertFalse(wc.is_available())
+
+    def test_get_bridge_status_when_down(self):
+        wc = WhatsAppChannel()
+        status = wc.get_bridge_status()
+        self.assertFalse(status["connected"])
+        self.assertEqual(status["status"], "error")
+
+    def test_router_registration(self):
+        router = ChannelRouter()
+        wc = WhatsAppChannel()
+        router.register(wc)
+        self.assertIs(router.get_channel("whatsapp"), wc)
+        self.assertIn("whatsapp", router.list_channels())
+
+    def test_on_inbound_empty_text(self):
+        wc = WhatsAppChannel()
+        # Empty text and no media should return None
+        result = wc.on_inbound({"from": "+33612345678", "text": "", "type": "text"})
+        self.assertIsNone(result)
+
+    def test_history_isolation(self):
+        wc = WhatsAppChannel()
+        # Each phone should have its own history
+        self.assertEqual(wc._histories, {})
+
+
 if __name__ == "__main__":
     unittest.main()
