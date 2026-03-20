@@ -657,6 +657,13 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_json(200, {"connected": False, "status": "unavailable", "phone": None, "qr": None})
 
+        # ── WhatsApp config GET ────────────────────────────────────────────────
+        elif path == "/v1/whatsapp/config":
+            cfg = configparser.ConfigParser()
+            cfg.read("/etc/clawbot/clawbot.cfg")
+            allow = cfg.get("whatsapp", "allow_from", fallback="*")
+            self.send_json(200, {"allow_from": allow})
+
         # ── OpenAI-compatible model listing (required by Open WebUI, LibreChat, etc.) ──
         elif path == "/v1/models":
             self.send_json(200, {"object": "list", "data": _get_models()})

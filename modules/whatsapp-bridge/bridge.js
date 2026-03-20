@@ -1,4 +1,3 @@
-'use strict';
 /**
  * WhatsApp Bridge for ClawbotCore
  * Connects Baileys (WhatsApp Web) to ClawbotCore via HTTP.
@@ -12,17 +11,24 @@
  *   POST http://127.0.0.1:8090/v1/channels/whatsapp/inbound
  */
 
-const {
-  default: makeWASocket,
+import {
+  makeWASocket,
   useMultiFileAuthState,
+  makeCacheableSignalKeyStore,
+  fetchLatestWaWebVersion,
+  Browsers,
   DisconnectReason,
   downloadMediaMessage,
-} = require('@whiskeysockets/baileys');
-const express = require('express');
-const QRCode = require('qrcode');
-const fs = require('fs');
-const path = require('path');
-const http = require('http');
+} from '@whiskeysockets/baileys';
+import express from 'express';
+import QRCode from 'qrcode';
+import fs from 'fs';
+import path from 'path';
+import http from 'http';
+import { fileURLToPath } from 'url';
+import pino from 'pino';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const BRIDGE_PORT = 3100;
 const CLAWBOT_HOST = '127.0.0.1';
@@ -38,18 +44,23 @@ let lastQr = null;           // data:image/png;base64,...
 let connStatus = 'disconnected'; // 'disconnected' | 'qr_pending' | 'connected' | 'error'
 let phoneNumber = null;      // '+33612345678'
 let reconnectCount = 0;
+const _sentByBridge = new Set(); // message IDs sent by us (to avoid loops)
 
 // ── Baileys socket ─────────────────────────────────────────────────────────────
 async function createWASocket() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  const logger = pino({ level: 'silent' });
+  const { version } = await fetchLatestWaWebVersion({});
 
   sock = makeWASocket({
-    auth: state,
-    browser: ['OpenJarvis', 'Chrome', '1.0.0'],
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, logger),
+    },
+    browser: Browsers.macOS('Desktop'),
+    version,
     connectTimeoutMs: 60000,
-    printQRInTerminal: false,
-    // Suppress noisy Baileys logs
-    logger: require('pino')({ level: 'silent' }),
+    logger,
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -71,9 +82,7 @@ async function createWASocket() {
       lastQr = null;
       reconnectCount = 0;
       // JID format: "33612345678:16@s.whatsapp.net" → "+33612345678"
-      const jid = (sock.authState && sock.authState.creds && sock.authState.creds.me)
-        ? sock.authState.creds.me.id
-        : '';
+      const jid = sock.user ? sock.user.id : '';
       const num = jid.split(':')[0].split('@')[0].replace(/[^0-9]/g, '');
       phoneNumber = num ? '+' + num : null;
       console.log('[bridge] Connected as', phoneNumber);
@@ -105,11 +114,20 @@ async function createWASocket() {
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-    for (const msg of messages) {
-      if (msg.key.fromMe) continue;
+  sock.ev.on('messages.upsert', async (upsert) => {
+    for (const msg of upsert.messages) {
       if (msg.key.remoteJid === 'status@broadcast') continue;
+      if (!msg.message) continue;
+      // Skip messages sent by the bridge itself (prevent loops)
+      if (_sentByBridge.has(msg.key.id)) {
+        _sentByBridge.delete(msg.key.id);
+        continue;
+      }
+      const isSelf = _isSelfChat(msg.key.remoteJid);
+      // type=notify → normal incoming; type=append → self-message or synced
+      if (upsert.type === 'notify' && msg.key.fromMe && !isSelf) continue;
+      if (upsert.type === 'append' && !isSelf) continue;
+      console.log('[bridge] inbound from:', msg.key.remoteJid);
       try {
         await _handleInbound(msg);
       } catch (e) {
@@ -117,6 +135,21 @@ async function createWASocket() {
       }
     }
   });
+}
+
+function _isSelfChat(jid) {
+  if (!sock || !sock.user) return false;
+  // sock.user.id can be "33642536328:16@s.whatsapp.net" or a LID
+  const myPhone = sock.user.id.split(':')[0].split('@')[0];
+  const remoteId = (jid || '').split(':')[0].split('@')[0];
+  // Direct match (same format)
+  if (myPhone === remoteId) return true;
+  // Also store LID of self if we see it in user.lid
+  if (sock.user.lid) {
+    const myLid = sock.user.lid.split(':')[0].split('@')[0];
+    if (myLid === remoteId) return true;
+  }
+  return false;
 }
 
 function _clearAuth() {
@@ -172,7 +205,9 @@ async function _handleInbound(msg) {
     return;
   }
 
-  const payload = JSON.stringify({ from, text, type: msgType, media_path: mediaPath });
+  // Use remoteJidAlt if available (gives real phone@s.whatsapp.net for @lid JIDs)
+  const altJid = msg.key.remoteJidAlt || '';
+  const payload = JSON.stringify({ from, jid, alt_jid: altJid, text, type: msgType, media_path: mediaPath });
   await _postToCore(CLAWBOT_INBOUND_PATH, payload);
 }
 
@@ -212,16 +247,22 @@ app.get('/status', (_req, res) => {
 });
 
 app.post('/send', async (req, res) => {
-  const { to, text } = req.body || {};
-  if (!to || !text) {
-    return res.status(400).json({ ok: false, error: 'missing to or text' });
+  const { to, jid: rawJid, text } = req.body || {};
+  if ((!to && !rawJid) || !text) {
+    return res.status(400).json({ ok: false, error: 'missing to/jid or text' });
   }
   if (connStatus !== 'connected') {
     return res.status(503).json({ ok: false, error: 'not connected' });
   }
   try {
-    const jid = to.replace(/^\+/, '') + '@s.whatsapp.net';
+    // Use raw JID if provided (for @lid format), otherwise convert phone to @s.whatsapp.net
+    const jid = rawJid || (to.replace(/^\+/, '') + '@s.whatsapp.net');
     const result = await sock.sendMessage(jid, { text });
+    // Track sent message ID to prevent loop on self-chat
+    if (result && result.key && result.key.id) {
+      _sentByBridge.add(result.key.id);
+      setTimeout(() => _sentByBridge.delete(result.key.id), 30000);
+    }
     res.json({ ok: true, messageId: result && result.key ? result.key.id : null });
   } catch (e) {
     console.error('[bridge] send error:', e.message);

@@ -76,11 +76,17 @@ class WhatsAppChannel(ChannelBase):
 
     def send_message(self, to: str, content: str, content_type: str = "text") -> dict:
         """Send a text or audio message via the bridge."""
+        # If 'to' contains @ it's a raw JID, pass as jid field
+        is_jid = "@" in to
         if content_type == "audio":
-            payload = json.dumps({"to": to, "audio_path": content}).encode()
+            body = {"audio_path": content}
+            body["jid" if is_jid else "to"] = to
+            payload = json.dumps(body).encode()
             endpoint = f"{BRIDGE_URL}/send-audio"
         else:
-            payload = json.dumps({"to": to, "text": content}).encode()
+            body = {"text": content}
+            body["jid" if is_jid else "to"] = to
+            payload = json.dumps(body).encode()
             endpoint = f"{BRIDGE_URL}/send"
 
         req = urllib.request.Request(
@@ -110,6 +116,8 @@ class WhatsAppChannel(ChannelBase):
         """
         raw_from = payload.get("from", "")
         sender = self.normalize_sender(raw_from)
+        # JID for reply — use original JID from bridge (supports @lid format)
+        reply_jid = payload.get("jid", "")
 
         if not self._is_allowed(sender):
             log.info("WhatsApp: ignoring message from %s (not in allow_from)", sender)
@@ -130,7 +138,7 @@ class WhatsAppChannel(ChannelBase):
         # Run in a background thread so the bridge gets an immediate 200
         threading.Thread(
             target=self._reply_async,
-            args=(sender, user_content),
+            args=(sender, user_content, reply_jid),
             daemon=True,
         ).start()
 
@@ -144,7 +152,7 @@ class WhatsAppChannel(ChannelBase):
 
     # ── Internal ────────────────────────────────────────────────────────────────
 
-    def _reply_async(self, sender: str, user_content: str) -> None:
+    def _reply_async(self, sender: str, user_content: str, reply_jid: str = "") -> None:
         """Call orchestrator, send reply. Runs in a background thread."""
         with self._lock:
             history = list(self._histories.get(sender, []))
@@ -160,8 +168,10 @@ class WhatsAppChannel(ChannelBase):
             self._histories[sender] = history[-(MAX_HISTORY * 2):]
 
         # Send reply in chunks respecting WhatsApp 4000-char limit
+        # Use JID if available (supports @lid format), fallback to phone number
+        reply_to = reply_jid if reply_jid else sender
         for chunk in self.chunk_text(reply):
-            self.send_message(sender, chunk)
+            self.send_message(reply_to, chunk)
 
     def _call_orchestrator(self, message: str, history: list) -> str:
         """POST to ClawbotCore /v1/chat/completions (non-streaming)."""
