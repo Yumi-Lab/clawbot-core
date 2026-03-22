@@ -8,7 +8,7 @@ import os
 import subprocess
 import urllib.request
 
-MODULES_DIR = "/home/pi/.clawbot/modules"
+MODULES_DIR = "/home/pi/.openjarvis/modules"
 STORE_URL = "https://raw.githubusercontent.com/Yumi-Lab/clawbot-core/main/store/index.json"
 STORE_CACHE_TTL = 300  # seconds
 

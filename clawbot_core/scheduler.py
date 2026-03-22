@@ -1,6 +1,6 @@
 """
 ClawbotOS Task Scheduler
-Scheduled tasks stored in /home/pi/.clawbot/scheduled-tasks.json
+Scheduled tasks stored in /home/pi/.openjarvis/scheduled-tasks.json
 Background thread checks every 30s and executes due tasks via ClawbotCore tool loop.
 """
 import json
@@ -11,7 +11,7 @@ import time
 import uuid
 from datetime import datetime, timedelta
 
-TASKS_PATH = "/home/pi/.clawbot/scheduled-tasks.json"
+TASKS_PATH = "/home/pi/.openjarvis/scheduled-tasks.json"
 log = logging.getLogger(__name__)
 
 

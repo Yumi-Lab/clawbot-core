@@ -11,6 +11,7 @@ from channels.base import (
 )
 from channels.router import ChannelRouter
 from channels.whatsapp import WhatsAppChannel
+from channels.wecom import WeComChannel
 
 __all__ = [
     "ChannelBase",
@@ -19,4 +20,5 @@ __all__ = [
     "MessageOut",
     "ChannelRouter",
     "WhatsAppChannel",
+    "WeComChannel",
 ]

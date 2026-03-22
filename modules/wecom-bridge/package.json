@@ -1,0 +1,16 @@
+{
+  "name": "wecom-bridge",
+  "version": "1.0.0",
+  "description": "WeCom (Enterprise WeChat) bridge for ClawbotCore — WebSocket SDK + HTTP",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js"
+  },
+  "dependencies": {
+    "@wecom/aibot-node-sdk": "^1.0.4",
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

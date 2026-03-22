@@ -1,0 +1,9 @@
+{
+  "id": "wecom-bridge",
+  "name": "WeCom Bridge",
+  "version": "0.1.0",
+  "description": "Enterprise WeChat (WeCom) messaging bridge",
+  "port": 3101,
+  "service": "wecom-bridge",
+  "tool_definitions": []
+}

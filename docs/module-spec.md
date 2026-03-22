@@ -36,7 +36,7 @@ clawbot-my-module/
 | Field | Type | Description |
 |-------|------|-------------|
 | `api_prefix` | string | HTTP prefix your module serves e.g. `"/v1/camera/"` |
-| `tools` | array | PicoClaw tool names your module exposes |
+| `tools` | array | ClawbotCore tool names your module exposes |
 | `requires` | array | Hardware requirements e.g. `["camera_hardware"]` |
 | `web_app` | object | Mini web app served in the dashboard (see below) |
 
@@ -59,7 +59,7 @@ ClawbotCore calls this to verify the module is running.
 
 | Range | Usage |
 |-------|-------|
-| 8080 | PicoClaw (reserved) |
+| 8080 | (free) |
 | 8089 | clawbot-status-api (reserved) |
 | 8090 | ClawbotCore (reserved) |
 | 8091–8199 | Community modules |

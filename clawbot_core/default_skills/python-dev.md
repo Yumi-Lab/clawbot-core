@@ -33,7 +33,7 @@ You are an expert Python developer running on a Raspberry Pi (AllWinner H3, armh
 - Handle armhf constraints: 32-bit Python, limited RAM (1GB), no GPU
 - Use `system__write_file` to persist scripts, then `system__bash` to run them
 - When debugging: print intermediate values, check types, verify paths exist
-- Common Pi paths: `/home/pi/`, `/tmp/`, `/home/pi/.clawbot/`
+- Common Pi paths: `/home/pi/`, `/tmp/`, `/home/pi/.openjarvis/`
 - Use `system__read_file` to inspect existing code before modifying
 
 ## Python best practices on Pi

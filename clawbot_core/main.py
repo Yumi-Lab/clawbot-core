@@ -29,11 +29,29 @@ Endpoints:
   POST /core/skills/{id}/disable   — disable skill
   DELETE /core/skills/{id}         — delete skill (builtin skills cannot be deleted)
 
+  GET  /core/vault                  — list secrets (names + categories, no values)
+  GET  /core/vault/{name}          — get secret (partially masked value)
+  POST /core/vault                  — store secret  body: {name, value, category}
+  DELETE /core/vault/{name}         — delete secret (requires X-Vault-Confirm: true)
+
+  GET  /core/vault/protected        — list protected words (names + aliases, no values)
+  GET  /core/vault/protected/{name} — get protected word (partially masked value)
+  POST /core/vault/protected        — store protected word  body: {name, value, kind, category}
+  DELETE /core/vault/protected/{name} — delete protected (requires X-Vault-Confirm: true)
+
+  GET  /core/vault/master-password  — check master password status  {has_master, locked}
+  POST /core/vault/master-password  — set master password  body: {password, confirm}
+  POST /core/vault/unlock           — unlock vault  body: {password} → 200 or 401
+  GET  /core/vault/usb              — detect USB drives + list backup files
+  POST /core/vault/backup-usb       — backup vault to USB  body: {password, usb_path}
+  POST /core/vault/restore-usb      — restore vault from USB  body: {password, backup_file}
+
   POST /v1/chat/completions        — tool-aware chat proxy (→ ClawBot Core + module tools)
 """
 
 import base64
 import configparser
+from datetime import datetime
 import json
 import logging
 import os
@@ -49,8 +67,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, unquote, parse_qs
 
-SESSIONS_DIR = "/home/pi/.clawbot/sessions"
-SESSIONS_TRASH_DIR = "/home/pi/.clawbot/sessions_trash"
+SESSIONS_DIR = "/home/pi/.openjarvis/sessions"
+SESSIONS_TRASH_DIR = "/home/pi/.openjarvis/sessions_trash"
 
 
 def _save_assistant_to_session(session_id, content):
@@ -75,8 +93,8 @@ def _save_assistant_to_session(session_id, content):
     except Exception as e:
         log.warning("Background session save failed: %s", e)
 
-AGENT_SESSION_FILE = "/home/pi/.picoclaw/workspace/sessions/agent_main_main.json"
-AGENT_WORKSPACE    = "/home/pi/.picoclaw/workspace"
+AGENT_SESSION_FILE = "/home/pi/workshop/sessions/agent_main_main.json"
+AGENT_WORKSPACE    = "/home/pi/workshop"
 AGENT_TOKEN_THRESHOLD = 10000  # estimated tokens before compaction
 AGENT_KEEP_RECENT = 8          # keep last N messages verbatim
 
@@ -91,6 +109,7 @@ from channels.api import APIChannel as _APIChannel
 from channels.telegram import TelegramChannel as _TelegramChannel
 from channels.voice import VoiceChannel as _VoiceChannel
 from channels.whatsapp import WhatsAppChannel as _WhatsAppChannel
+from channels.wecom import WeComChannel as _WeComChannel
 
 def _init_channels():
     """Initialize channel router with default channels."""
@@ -105,6 +124,8 @@ def _init_channels():
         router.register(_VoiceChannel())
     if not router.get_channel("whatsapp"):
         router.register(_WhatsAppChannel())
+    if not router.get_channel("wecom"):
+        router.register(_WeComChannel())
     return router
 
 _channel_router = _init_channels()
@@ -127,7 +148,7 @@ def _wa_start_bridge(allow_from: str = "*"):
     env = os.environ.copy()
     env["ALLOW_FROM"] = allow_from
     env["CORE_URL"] = "http://127.0.0.1:8090"
-    env["AUTH_DIR"] = "/home/pi/.clawbot/wa-auth"
+    env["AUTH_DIR"] = "/home/pi/.openjarvis/wa-auth"
     try:
         _wa_proc = subprocess.Popen(
             ["node", bridge_js],
@@ -417,7 +438,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Vault-Confirm")
+        self.send_header("Access-Control-Expose-Headers", "Content-Disposition")
         self.end_headers()
 
     def do_PUT(self):
@@ -600,7 +622,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, _load_search_engines())
 
         elif path == "/core/search-engines/scan":
-            _scan_path = "/home/pi/.clawbot/scan-results.json"
+            _scan_path = "/home/pi/.openjarvis/scan-results.json"
             try:
                 with open(_scan_path) as _sf:
                     self.send_json(200, json.load(_sf))
@@ -610,12 +632,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(500, {"error": str(e)})
 
         elif path == "/core/search-engines/models":
-            # Always return the 4 known ClawBot models (configured via device config)
+            # All known ClawBot models across providers
             models = [
-                {"model": "claude-haiku-4-5-20251001", "provider": "Anthropic", "group": "Anthropic", "configured": True},
-                {"model": "claude-sonnet-4-6",         "provider": "Anthropic", "group": "Anthropic", "configured": True},
-                {"model": "claude-opus-4-6",           "provider": "Anthropic", "group": "Anthropic", "configured": True},
-                {"model": "kimi-for-coding",           "provider": "Moonshot",  "group": "Moonshot",  "configured": True},
+                {"model": "claude-haiku-4-5-20251001", "provider": "Anthropic",  "group": "Anthropic",  "configured": True},
+                {"model": "claude-sonnet-4-6",         "provider": "Anthropic",  "group": "Anthropic",  "configured": True},
+                {"model": "claude-opus-4-6",           "provider": "Anthropic",  "group": "Anthropic",  "configured": True},
+                {"model": "kimi-for-coding",           "provider": "Moonshot",   "group": "Moonshot",   "configured": True},
+                {"model": "qwen3.5-flash",             "provider": "DashScope",  "group": "Qwen",       "configured": True},
+                {"model": "qwen3.5-plus",              "provider": "DashScope",  "group": "Qwen",       "configured": True},
+                {"model": "qwen3-max",                 "provider": "DashScope",  "group": "Qwen",       "configured": True},
+                {"model": "qwen3-coder-plus",          "provider": "DashScope",  "group": "Qwen",       "configured": True},
+                {"model": "qwen3-coder-flash",         "provider": "DashScope",  "group": "Qwen",       "configured": True},
+                {"model": "qwq-plus",                  "provider": "DashScope",  "group": "Qwen",       "configured": True},
+                {"model": "deepseek-chat",             "provider": "DeepSeek",   "group": "DeepSeek",   "configured": True},
             ]
             self.send_json(200, {"models": models, "source": "device-config"})
 
@@ -661,8 +690,30 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/v1/whatsapp/config":
             cfg = configparser.ConfigParser()
             cfg.read("/etc/clawbot/clawbot.cfg")
-            allow = cfg.get("whatsapp", "allow_from", fallback="*")
-            self.send_json(200, {"allow_from": allow})
+            self.send_json(200, {
+                "allow_from": cfg.get("whatsapp", "allow_from", fallback="*"),
+                "default_model": cfg.get("whatsapp", "default_model", fallback="default"),
+                "default_mode": cfg.get("whatsapp", "default_mode", fallback="core"),
+            })
+
+        # ── WeCom bridge status proxy ─────────────────────────────────────────
+        elif path == "/v1/wecom/status":
+            channel = _channel_router.get_channel("wecom")
+            if channel:
+                self.send_json(200, channel.get_bridge_status())
+            else:
+                self.send_json(200, {"connected": False, "status": "unavailable", "botId": None})
+
+        # ── WeCom config GET ─────────────────────────────────────────────────
+        elif path == "/v1/wecom/config":
+            cfg = configparser.ConfigParser()
+            cfg.read("/etc/clawbot/clawbot.cfg")
+            self.send_json(200, {
+                "bot_id": cfg.get("wecom", "bot_id", fallback=""),
+                "allow_from": cfg.get("wecom", "allow_from", fallback="*"),
+                "default_model": cfg.get("wecom", "default_model", fallback="default"),
+                "default_mode": cfg.get("wecom", "default_mode", fallback="core"),
+            })
 
         # ── OpenAI-compatible model listing (required by Open WebUI, LibreChat, etc.) ──
         elif path == "/v1/models":
@@ -766,6 +817,77 @@ class Handler(BaseHTTPRequestHandler):
                 connected = False
             self.send_json(200, {"connected": connected})
 
+        # ── Vault: GET /core/vault, /core/vault/{name} ────────────────────────
+        elif path == "/core/vault":
+            try:
+                v = get_vault()
+                items = v.list()
+                self.send_json(200, {"secrets": items})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path.startswith("/core/vault/protected/"):
+            name = unquote(path[len("/core/vault/protected/"):])
+            if not name or ".." in name:
+                self.send_json(400, {"error": "invalid name"})
+                return
+            try:
+                from vault import Vault
+                v = get_vault()
+                val = v.get_protected(name)
+                if val is None:
+                    self.send_json(404, {"error": f"Protected word '{name}' not found"})
+                else:
+                    self.send_json(200, {"name": name, "masked_value": Vault.mask_value(val)})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path == "/core/vault/protected":
+            try:
+                v = get_vault()
+                qs = parse_qs(urlparse(self.path).query)
+                kind = qs.get("kind", [None])[0]
+                reveal = qs.get("reveal", [""])[0] == "true" and not v.is_locked()
+                items = v.list_protected(kind, reveal=reveal)
+                self.send_json(200, {"protected": items})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path == "/core/vault/master-password":
+            try:
+                v = get_vault()
+                self.send_json(200, {"has_master": v.has_master_password(), "locked": v.is_locked()})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path == "/core/vault/usb":
+            try:
+                from vault import Vault
+                drives = Vault.detect_usb_drives()
+                self.send_json(200, {"drives": drives})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path.startswith("/core/vault/"):
+            name = unquote(path[len("/core/vault/"):])
+            if not name or ".." in name:
+                self.send_json(400, {"error": "invalid name"})
+                return
+            try:
+                from vault import Vault
+                v = get_vault()
+                val = v.get(name)
+                if val is None:
+                    self.send_json(404, {"error": f"Secret '{name}' not found"})
+                else:
+                    qs = parse_qs(urlparse(self.path).query)
+                    if qs.get("reveal", ["0"])[0] == "1":
+                        self.send_json(200, {"name": name, "value": val, "masked_value": Vault.mask_value(val)})
+                    else:
+                        self.send_json(200, {"name": name, "masked_value": Vault.mask_value(val)})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -851,7 +973,7 @@ class Handler(BaseHTTPRequestHandler):
                                 cfg["reliability"] = max(0.1, cfg.get("reliability", 0.5) * 0.8)
                                 entry["status"] = "fail"
                                 entry["error"] = "No AI model configured — cannot adapt"
-                                logs.append("  ✗ No AI model available (check PicoClaw config)")
+                                logs.append("  ✗ No AI model available (check AI config)")
                     except Exception as e:
                         cfg["reliability"] = max(0.1, cfg.get("reliability", 0.5) * 0.8)
                         entry["status"] = "error"
@@ -863,7 +985,7 @@ class Handler(BaseHTTPRequestHandler):
                 _save_search_engines(engines)
                 # Persist scan results — merge with previous if single-engine scan
                 import datetime as _dt
-                _scan_path = "/home/pi/.clawbot/scan-results.json"
+                _scan_path = "/home/pi/.openjarvis/scan-results.json"
                 if filter_engine:
                     # Merge: keep previous results, update only the scanned engine
                     try:
@@ -887,7 +1009,7 @@ class Handler(BaseHTTPRequestHandler):
                         "results": report,
                     }
                 try:
-                    os.makedirs("/home/pi/.clawbot", exist_ok=True)
+                    os.makedirs("/home/pi/.openjarvis", exist_ok=True)
                     with open(_scan_path, "w") as _sf:
                         json.dump(_scan_payload, _sf)
                 except Exception:
@@ -912,6 +1034,29 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "session_id required"})
             return
 
+        # Tool sandbox approval decision
+        if path == "/v1/tool-approval":
+            from orchestrator import resolve_approval
+            call_id = data.get("call_id", "")
+            decision = data.get("decision", "deny")
+            remember = data.get("remember", "never")
+            if not call_id:
+                self.send_json(400, {"error": "call_id required"})
+                return
+            if decision not in ("allow", "deny"):
+                self.send_json(400, {"error": "decision must be 'allow' or 'deny'"})
+                return
+            if remember not in ("session", "always", "never"):
+                self.send_json(400, {"error": "remember must be 'session', 'always', or 'never'"})
+                return
+            found = resolve_approval(call_id, decision, remember)
+            if found:
+                log.info("Tool approval: call_id=%s decision=%s remember=%s", call_id, decision, remember)
+                self.send_json(200, {"ok": True, "call_id": call_id, "decision": decision})
+            else:
+                self.send_json(404, {"error": "No pending approval for this call_id"})
+            return
+
         # WhatsApp bridge management
         if path == "/wa/connect":
             allow_from = data.get("allow_from", "*")
@@ -924,19 +1069,23 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"ok": True})
             return
 
-        # WhatsApp allow_from config update
+        # WhatsApp config update (allow_from, default_model, default_mode)
         if path == "/v1/whatsapp/config":
-            allow = data.get("allow_from", "*").strip()
             try:
                 cfg_path = "/etc/clawbot/clawbot.cfg"
                 cfg = configparser.ConfigParser()
                 cfg.read(cfg_path)
                 if not cfg.has_section("whatsapp"):
                     cfg.add_section("whatsapp")
-                cfg.set("whatsapp", "allow_from", allow)
+                if "allow_from" in data:
+                    cfg.set("whatsapp", "allow_from", data["allow_from"].strip())
+                if "default_model" in data:
+                    cfg.set("whatsapp", "default_model", data["default_model"].strip())
+                if "default_mode" in data:
+                    cfg.set("whatsapp", "default_mode", data["default_mode"].strip())
                 with open(cfg_path, "w") as f:
                     cfg.write(f)
-                self.send_json(200, {"ok": True, "message": "allow_from updated"})
+                self.send_json(200, {"ok": True, "message": "whatsapp config updated"})
             except Exception as e:
                 log.error("WhatsApp config error: %s", e)
                 self.send_json(500, {"error": str(e)})
@@ -955,10 +1104,20 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         # WhatsApp logout — clear bridge session and restart bridge
+        if path == "/v1/whatsapp/restart":
+            try:
+                _wa_stop_bridge()
+                _wa_start_bridge()
+                self.send_json(200, {"ok": True, "message": "WhatsApp bridge restarted"})
+            except Exception as e:
+                log.error("WhatsApp restart error: %s", e)
+                self.send_json(500, {"error": str(e)})
+            return
+
         if path == "/v1/whatsapp/logout":
             try:
                 import shutil
-                auth_dir = "/home/pi/.clawbot/wa-auth"
+                auth_dir = "/home/pi/.openjarvis/wa-auth"
                 if os.path.isdir(auth_dir):
                     shutil.rmtree(auth_dir)
                     os.makedirs(auth_dir, exist_ok=True)
@@ -968,6 +1127,52 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {"ok": True, "message": "Session cleared — rescan QR to reconnect"})
             except Exception as e:
                 log.error("WhatsApp logout error: %s", e)
+                self.send_json(500, {"error": str(e)})
+            return
+
+        # WeCom config update (bot_id, secret, allow_from, default_model, default_mode)
+        if path == "/v1/wecom/config":
+            try:
+                cfg_path = "/etc/clawbot/clawbot.cfg"
+                cfg = configparser.ConfigParser()
+                cfg.read(cfg_path)
+                if not cfg.has_section("wecom"):
+                    cfg.add_section("wecom")
+                for key in ("bot_id", "secret", "allow_from", "default_model", "default_mode"):
+                    if key in data:
+                        cfg.set("wecom", key, data[key].strip())
+                with open(cfg_path, "w") as f:
+                    cfg.write(f)
+                self.send_json(200, {"ok": True, "message": "wecom config updated"})
+            except Exception as e:
+                log.error("WeCom config error: %s", e)
+                self.send_json(500, {"error": str(e)})
+            return
+
+        # WeCom inbound — called by the WeCom bridge
+        if path == "/v1/channels/wecom/inbound":
+            channel = _channel_router.get_channel("wecom")
+            if channel:
+                try:
+                    channel.on_inbound(data)
+                except Exception as e:
+                    log.error("WeCom inbound error: %s", e)
+            self.send_json(200, {"ok": True})
+            return
+
+        # WeCom reconnect — reload config and reconnect bridge
+        if path == "/v1/wecom/reconnect":
+            try:
+                import urllib.request as _ur
+                req = _ur.Request("http://127.0.0.1:3101/reconnect",
+                                  data=b"{}",
+                                  headers={"Content-Type": "application/json"},
+                                  method="POST")
+                with _ur.urlopen(req, timeout=5) as resp:
+                    result = json.loads(resp.read())
+                self.send_json(200, result)
+            except Exception as e:
+                log.error("WeCom reconnect error: %s", e)
                 self.send_json(500, {"error": str(e)})
             return
 
@@ -1285,101 +1490,6 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(500, {"error": str(e)})
             return
 
-        # Picoclaw native agent (14 built-in tools)
-        if path == "/v1/picoclaw-agent":
-            session_id_pc = data.get("session_id")
-            messages = data.get("messages", [])
-            msg = next(
-                (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"),
-                ""
-            )
-            if not msg:
-                self.send_json(400, {"error": "no user message"})
-                return
-            try:
-                verbose = data.get("verbose", False)
-                # Auto-compact session if context is too large (like Claude Code /compact)
-                _maybe_compact_agent_session()
-                env = os.environ.copy()
-                env["HOME"] = "/home/pi"
-                # Use Popen + process group so we can kill all child processes on timeout
-                proc = subprocess.Popen(
-                    ["/usr/local/bin/picoclaw", "agent", "--message", msg],  # legacy agent binary
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    preexec_fn=os.setsid,
-                    env=env,
-                )
-                try:
-                    stdout_b, stderr_b = proc.communicate(timeout=240)
-                    stdout_text = stdout_b.decode("utf-8", errors="replace")
-                    stderr_text = stderr_b.decode("utf-8", errors="replace")
-                except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    proc.wait()
-                    self.send_json(504, {"error": "agent timed out"})
-                    return
-                # Always parse: extract clean final response + full trace
-                raw = (stdout_text + stderr_text).encode("utf-8", errors="replace")
-                meta = re.search(rb"\{[^}]*final_length=(\d+)[^}]*\}", raw)
-                # Agent binary emits 🦞 (shrimp U+1F99E) before the final response
-                shrimp = "🦞".encode()
-                crab = raw.find(shrimp)
-
-                if meta and crab >= 0:
-                    final_len = int(meta.group(1))
-                    start = crab + len(shrimp)
-                    while start < len(raw) and raw[start:start+1] in (b" ", b"\n", b"\r"):
-                        start += 1
-                    clean = raw[start:start + final_len].decode("utf-8", errors="replace").strip()
-                    # Trace = tool execution output AFTER the final response, before stats
-                    meta_start = raw.find(meta.group(0))
-                    trace_raw = raw[start + final_len:meta_start].decode("utf-8", errors="replace")
-                else:
-                    # Fallback: strip log lines, shrimp prefix, and metadata line
-                    log_pat = re.compile(r"^\d{4}/\d{2}/\d{2} ")
-                    meta_pat = re.compile(r"\{[^}]*final_length=\d+[^}]*\}")
-                    lines = (stdout_text + stderr_text).splitlines()
-                    resp_lines = [
-                        l for l in lines
-                        if not log_pat.match(l) and not meta_pat.search(l) and l.strip()
-                    ]
-                    clean = re.sub(r"^🦞\s*", "", "\n".join(resp_lines).strip())
-                    trace_raw = "\n".join(resp_lines)
-
-                # Parse trace into structured steps for the UI
-                steps = _parse_agent_steps(trace_raw, clean) if verbose else []
-
-                if not clean:
-                    clean = "(no response)"
-
-                # Build SSE: optional trace event + final response
-                parts = []
-                if verbose and steps:
-                    steps_data = json.dumps({"steps": steps})
-                    parts.append(f"event: trace\ndata: {steps_data}\n\n")
-                final_data = json.dumps({"choices": [{"delta": {"content": clean}, "index": 0}]})
-                parts.append(f"data: {final_data}\n\n")
-                parts.append("data: [DONE]\n\n")
-                sse = "".join(parts).encode()
-                try:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/event-stream")
-                    self.send_header("Cache-Control", "no-cache")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.send_header("Content-Length", str(len(sse)))
-                    self.end_headers()
-                    self.wfile.write(sse)
-                except BrokenPipeError:
-                    log.info("Client disconnected, saving to session %s", session_id_pc)
-                    _save_assistant_to_session(session_id_pc, clean)
-            except Exception as e:
-                log.error("agent error: %s", e)
-                self.send_json(500, {"error": str(e)})
-            return
-
         # ── Service control: POST /core/services/{name}/start|stop|restart ─────────
         if path.startswith("/core/services/"):
             parts_svc = path.split("/")
@@ -1514,6 +1624,206 @@ class Handler(BaseHTTPRequestHandler):
                 log.error("GDrive auth failed: %s", e)
                 self.send_json(500, {"error": str(e)})
 
+        # ── Vault: POST /core/vault, POST /core/vault/protected ───────────────
+        elif path == "/core/vault":
+            name = data.get("name", "").strip()
+            value = data.get("value", "")
+            category = data.get("category", "other")
+            note = data.get("note", "")
+            username = data.get("username", "")
+            if not name or not value:
+                self.send_json(400, {"error": "missing 'name' and 'value' fields"})
+                return
+            try:
+                v = get_vault()
+                ok = v.store(name, value, category, note, username)
+                if ok:
+                    self.send_json(200, {"ok": True, "name": name, "category": category})
+                else:
+                    self.send_json(500, {"error": "failed to store secret"})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path == "/core/vault/import":
+            # Import from password manager (base64-encoded file in JSON)
+            file_data = data.get("file_data", "")
+            filename = data.get("filename", "export.csv")
+            source = data.get("source", "auto")
+            if not file_data:
+                self.send_json(400, {"error": "missing 'file_data' field (base64)"})
+                return
+            try:
+                raw = base64.b64decode(file_data)
+            except Exception:
+                self.send_json(400, {"error": "invalid base64 data"})
+                return
+            # Reject files > 5MB
+            if len(raw) > 5 * 1024 * 1024:
+                self.send_json(413, {"error": "file too large (max 5MB)"})
+                return
+            try:
+                import tempfile
+                ext = os.path.splitext(filename)[1] or ".csv"
+                fd, tmppath = tempfile.mkstemp(prefix="vault_import_", suffix=ext)
+                os.chmod(tmppath, 0o600)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(raw)
+                v = get_vault()
+                result = v.import_file(tmppath, source)
+                # Ensure tmpfile is gone (import_file already deletes, but just in case)
+                if os.path.exists(tmppath):
+                    os.unlink(tmppath)
+                self.send_json(200, result)
+            except Exception as e:
+                # Cleanup on error
+                try:
+                    if os.path.exists(tmppath):
+                        os.unlink(tmppath)
+                except Exception:
+                    pass
+                self.send_json(500, {"error": str(e)})
+
+        elif path == "/core/vault/protected":
+            name = data.get("name", "").strip()
+            value = data.get("value", "")
+            kind = data.get("kind", "pii")
+            category = data.get("category", "")
+            if not name or not value:
+                self.send_json(400, {"error": "missing 'name' and 'value' fields"})
+                return
+            try:
+                v = get_vault()
+                ok = v.store_protected(name, value, kind, category)
+                if ok:
+                    self.send_json(200, {"ok": True, "name": name, "alias": f"__vault_{name}__", "kind": kind})
+                else:
+                    self.send_json(500, {"error": "failed to store protected word"})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path == "/core/vault/master-password":
+            password = data.get("password", "")
+            confirm = data.get("confirm", "")
+            if not password or not confirm:
+                self.send_json(400, {"error": "missing 'password' and 'confirm' fields"})
+                return
+            if password != confirm:
+                self.send_json(400, {"error": "passwords do not match"})
+                return
+            if len(password) < 8:
+                self.send_json(400, {"error": "password must be at least 8 characters"})
+                return
+            try:
+                v = get_vault()
+                v.set_master_password(password)
+                self.send_json(200, {"ok": True})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path == "/core/vault/unlock":
+            password = data.get("password", "")
+            if not password:
+                self.send_json(400, {"error": "missing 'password' field"})
+                return
+            try:
+                v = get_vault()
+                if v.unlock(password):
+                    self.send_json(200, {"ok": True})
+                else:
+                    self.send_json(401, {"error": "invalid master password"})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path == "/core/vault/export":
+            # Export vault as downloadable encrypted file
+            password = data.get("password", "")
+            if not password:
+                self.send_json(400, {"error": "missing 'password' field"})
+                return
+            try:
+                v = get_vault()
+                # Auto-unlock if vault is locked (verify master password)
+                if v.is_locked():
+                    if not v.unlock(password):
+                        self.send_json(401, {"error": "invalid master password"})
+                        return
+                blob = v.export_encrypted(password)
+                filename = f"clawbot-vault-{datetime.now().strftime('%Y%m%d-%H%M%S')}.enc"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", str(len(blob)))
+                self.end_headers()
+                self.wfile.write(blob)
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+            return
+
+        elif path == "/core/vault/backup-usb":
+            password = data.get("password", "")
+            usb_path = data.get("usb_path", "")
+            if not password or not usb_path:
+                self.send_json(400, {"error": "missing 'password' and 'usb_path' fields"})
+                return
+            # Security: prevent path traversal
+            if ".." in usb_path or not usb_path.startswith(("/media/", "/mnt/")):
+                self.send_json(400, {"error": "invalid USB path"})
+                return
+            try:
+                v = get_vault()
+                filename = v.backup_to_usb(password, usb_path)
+                self.send_json(200, {"ok": True, "filename": filename})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path == "/core/vault/import-backup":
+            # Import vault from uploaded .enc backup file (base64-encoded)
+            file_data = data.get("file_data", "")
+            password = data.get("password", "")
+            if not file_data or not password:
+                self.send_json(400, {"error": "missing 'file_data' and 'password' fields"})
+                return
+            try:
+                raw = base64.b64decode(file_data)
+            except Exception:
+                self.send_json(400, {"error": "invalid base64 data"})
+                return
+            if len(raw) > 10 * 1024 * 1024:
+                self.send_json(413, {"error": "file too large (max 10MB)"})
+                return
+            try:
+                v = get_vault()
+                # Auto-unlock if vault is locked (password will also decrypt the backup)
+                if v.is_locked() and v.has_master_password():
+                    if not v.unlock(password):
+                        self.send_json(401, {"error": "invalid master password — unlock vault first"})
+                        return
+                result = v.import_encrypted(raw, password)
+                if result.get("errors"):
+                    self.send_json(400, result)
+                else:
+                    self.send_json(200, result)
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path == "/core/vault/restore-usb":
+            password = data.get("password", "")
+            backup_file = data.get("backup_file", "")
+            if not password or not backup_file:
+                self.send_json(400, {"error": "missing 'password' and 'backup_file' fields"})
+                return
+            # Security: prevent path traversal
+            if ".." in backup_file or not backup_file.startswith(("/media/", "/mnt/")):
+                self.send_json(400, {"error": "invalid backup path"})
+                return
+            try:
+                v = get_vault()
+                result = v.restore_from_usb(password, backup_file)
+                self.send_json(200, result)
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -1602,6 +1912,44 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 log.error("GDrive disconnect failed: %s", e)
                 self.send_json(500, {"error": str(e)})
+
+        # ── Vault: DELETE /core/vault/{name}, /core/vault/protected/{name} ────
+        elif path.startswith("/core/vault/protected/"):
+            if self.headers.get("X-Vault-Confirm") != "true":
+                self.send_json(403, {"error": "missing X-Vault-Confirm: true header"})
+                return
+            name = unquote(path[len("/core/vault/protected/"):])
+            if not name or ".." in name:
+                self.send_json(400, {"error": "invalid name"})
+                return
+            try:
+                v = get_vault()
+                ok = v.delete_protected(name)
+                if ok:
+                    self.send_json(200, {"ok": True, "deleted": name})
+                else:
+                    self.send_json(404, {"error": f"Protected word '{name}' not found"})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path.startswith("/core/vault/"):
+            if self.headers.get("X-Vault-Confirm") != "true":
+                self.send_json(403, {"error": "missing X-Vault-Confirm: true header"})
+                return
+            name = unquote(path[len("/core/vault/"):])
+            if not name or ".." in name:
+                self.send_json(400, {"error": "invalid name"})
+                return
+            try:
+                v = get_vault()
+                ok = v.delete(name)
+                if ok:
+                    self.send_json(200, {"ok": True, "deleted": name})
+                else:
+                    self.send_json(404, {"error": f"Secret '{name}' not found"})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -1620,7 +1968,34 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         return conn, addr
 
 
+# ── Module-level vault singleton (persists unlock state across requests) ──────
+_vault_instance = None
+
+def get_vault():
+    """Get or create the module-level Vault singleton."""
+    global _vault_instance
+    if _vault_instance is None:
+        from vault import Vault
+        _vault_instance = Vault()
+    return _vault_instance
+
+
 if __name__ == "__main__":
+    # Vault: migrate legacy credentials on boot
+    try:
+        _migrated = get_vault().migrate_legacy_credentials()
+        if _migrated:
+            log.info("Vault boot migration: %s", _migrated)
+    except Exception as _e:
+        log.warning("Vault boot migration failed: %s", _e)
+
+    # Vault: auto-unlock at boot if enabled
+    try:
+        if get_vault().try_auto_unlock():
+            log.info("Vault auto-unlocked at boot")
+    except Exception as _e:
+        log.warning("Vault auto-unlock failed: %s", _e)
+
     from scheduler import start_scheduler
     start_scheduler()
     _channel_router.start_all()

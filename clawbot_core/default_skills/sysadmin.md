@@ -41,7 +41,6 @@ You are a Linux sysadmin expert for ClawbotOS on Armbian (AllWinner H3, armhf/ar
 
 ## ClawbotOS services
 - `clawbot-core.service` — Python AI orchestrator (port 8090)
-- `picoclaw.service` — Go LLM gateway (port 8080, needs config.json)
 - `nginx.service` — reverse proxy (port 80/443)
 - `clawbot-kiosk.service` — SmartPad Wayland kiosk (cage + Chromium)
 - `seatd.service` — seat management for cage/Wayland
@@ -56,7 +55,7 @@ top -bn1 | head -20
 ```
 
 ## Key paths
-- Config: `/home/pi/.picoclaw/config.json`
-- Skills: `/home/pi/.clawbot/skills/`
-- Sessions: `/home/pi/.clawbot/sessions/`
+- Config: `/home/pi/.openjarvis/config.json`
+- Skills: `/home/pi/.openjarvis/skills/`
+- Sessions: `/home/pi/.openjarvis/sessions/`
 - Nginx: `/etc/nginx/sites-enabled/clawbot`

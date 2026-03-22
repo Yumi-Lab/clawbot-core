@@ -35,8 +35,8 @@ const CLAWBOT_HOST = '127.0.0.1';
 const CLAWBOT_PORT = 8090;
 const CLAWBOT_INBOUND_PATH = '/v1/channels/whatsapp/inbound';
 const AUTH_DIR = process.env.AUTH_DIR || path.join(__dirname, 'auth');
-const MAX_RECONNECTS = 5;
-const RECONNECT_DELAY_MS = 3000;
+const MAX_RECONNECTS = 10;
+const RECONNECT_DELAY_MS = 5000;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let sock = null;
@@ -109,7 +109,8 @@ async function createWASocket() {
         setTimeout(createWASocket, RECONNECT_DELAY_MS);
       } else {
         connStatus = 'error';
-        console.error('[bridge] Max reconnects reached — manual restart required');
+        console.error('[bridge] Max reconnects reached — exiting for systemd restart');
+        setTimeout(() => process.exit(1), 1000);
       }
     }
   });
@@ -127,7 +128,7 @@ async function createWASocket() {
       // type=notify → normal incoming; type=append → self-message or synced
       if (upsert.type === 'notify' && msg.key.fromMe && !isSelf) continue;
       if (upsert.type === 'append' && !isSelf) continue;
-      console.log('[bridge] inbound from:', msg.key.remoteJid);
+      console.log('[bridge] inbound from:', msg.key.remoteJid, 'fromMe:', msg.key.fromMe, 'type:', upsert.type, 'altJid:', msg.key.remoteJidAlt || 'NONE');
       try {
         await _handleInbound(msg);
       } catch (e) {
@@ -166,7 +167,10 @@ async function _handleInbound(msg) {
   const jid = msg.key.remoteJid;
   if (!jid) return;
 
-  const rawNum = jid.split('@')[0].replace(/[^0-9]/g, '');
+  // Prefer alt_jid (real phone@s.whatsapp.net) over LID for phone extraction
+  const altJid = msg.key.remoteJidAlt || '';
+  const phoneSource = (altJid.includes('@s.whatsapp.net') ? altJid : jid);
+  const rawNum = phoneSource.split('@')[0].replace(/[^0-9]/g, '');
   const from = '+' + rawNum;
 
   let msgType = 'text';
@@ -205,9 +209,8 @@ async function _handleInbound(msg) {
     return;
   }
 
-  // Use remoteJidAlt if available (gives real phone@s.whatsapp.net for @lid JIDs)
-  const altJid = msg.key.remoteJidAlt || '';
   const payload = JSON.stringify({ from, jid, alt_jid: altJid, text, type: msgType, media_path: mediaPath });
+  console.log('[bridge] forwarding to core:', from, 'text:', (text || '').substring(0, 50), 'altJid:', altJid || 'NONE');
   await _postToCore(CLAWBOT_INBOUND_PATH, payload);
 }
 

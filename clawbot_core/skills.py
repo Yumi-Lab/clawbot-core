@@ -14,7 +14,7 @@ import re
 
 log = logging.getLogger(__name__)
 
-SKILLS_DIR = "/home/pi/.clawbot/skills"
+SKILLS_DIR = "/home/pi/.openjarvis/skills"
 DEFAULT_SKILLS_DIR = os.path.join(os.path.dirname(__file__), "default_skills")
 
 

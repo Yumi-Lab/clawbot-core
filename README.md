@@ -2,7 +2,7 @@
 
 The middleware layer for [ClawbotOS](https://github.com/Yumi-Lab/clawbot) — module registry, lifecycle management, and mini-app store.
 
-ClawbotCore is to ClawbotOS what Moonraker is to Klipper: the connective layer between the AI engine (PicoClaw) and all additional capabilities (modules).
+ClawbotCore is to ClawbotOS what Moonraker is to Klipper: the AI orchestrator that connects LLM providers to all additional capabilities (modules).
 
 ## Architecture
 
@@ -15,8 +15,8 @@ ClawbotCore is to ClawbotOS what Moonraker is to Klipper: the connective layer b
 │  • Mini web app hosting                    │
 └──────┬─────────────┬──────────────┬────────┘
        │             │              │
-  PicoClaw      status-api      modules/
-  :8080          :8089          voice, screen,
+  LLM APIs      status-api      modules/
+  (cloud)        :8089          voice, screen,
                                 camera, mqtt...
 ```
 

@@ -8,7 +8,7 @@ import os
 import subprocess
 import shutil
 
-MODULES_DIR = "/home/pi/.clawbot/modules"
+MODULES_DIR = "/home/pi/.openjarvis/modules"
 SYSTEMD_DIR = "/etc/systemd/system"
 
 
