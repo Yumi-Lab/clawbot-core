@@ -38,13 +38,11 @@ else
     git clone --depth=1 "${REPO}" "${INSTALL_DIR}"
 fi
 
-# ── 4. Python — stdlib only (no pip install needed) ──────────────────────────
+# ── 4. Python — stdlib only, no venv ─────────────────────────────────────────
 # ClawbotCore uses only Python standard library.
 # The only optional dependency is websockets (for cloud tunnel):
-python3 -m venv "${INSTALL_DIR}/.venv" 2>/dev/null || true
-if [[ -f "${INSTALL_DIR}/.venv/bin/pip" ]]; then
-    "${INSTALL_DIR}/.venv/bin/pip" install --quiet websockets 2>/dev/null || true
-fi
+pip3 install --quiet --break-system-packages websockets 2>/dev/null || \
+    apt-get install -y python3-websockets 2>/dev/null || true
 
 # ── 5. WhatsApp bridge (Node.js) ────────────────────────────────────────────
 WA_DIR="${INSTALL_DIR}/modules/whatsapp-bridge"
