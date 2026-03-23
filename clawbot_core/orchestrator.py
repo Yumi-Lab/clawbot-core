@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from registry import get_enabled_tools, load_local_modules
 from sandbox import SandboxManager, ToolPermission
+from tool_registry import get_builtin_tools, AGENT_MEMORY_TOOLS, DISPATCH_TABLE
 
 # ── Sandbox singleton ────────────────────────────────────────────────────────
 _sandbox = SandboxManager.get_instance()
@@ -164,6 +165,57 @@ def is_cancelled(session_id: str) -> bool:
 def clear_cancelled(session_id: str):
     _CANCELLED_SESSIONS.discard(session_id)
 
+# ── Mid-stream message injection (follow-up messages into active tool loop) ──
+_inject_queues: dict[str, list] = {}   # session_id → list of user messages to inject
+_inject_lock = threading.Lock()
+
+
+def inject_message(session_id: str, content: str) -> bool:
+    """Append a user message to the inject queue for an active session.
+    Returns True if session has an active tool loop, False otherwise."""
+    with _inject_lock:
+        if session_id not in _inject_queues:
+            return False  # no active session — caller should send normal request
+        _inject_queues[session_id].append(content)
+        return True
+
+
+def _register_inject_session(session_id: str):
+    """Register a session for mid-stream injection (called at tool loop start)."""
+    if not session_id:
+        return
+    with _inject_lock:
+        _inject_queues[session_id] = []
+
+
+def _unregister_inject_session(session_id: str) -> list[str]:
+    """Unregister session (called at tool loop end). Returns orphaned messages."""
+    if not session_id:
+        return []
+    with _inject_lock:
+        return _inject_queues.pop(session_id, [])
+
+
+def _drain_inject_queue(session_id: str) -> list[str]:
+    """Pop all pending inject messages for this session."""
+    if not session_id:
+        return []
+    with _inject_lock:
+        msgs = _inject_queues.get(session_id, [])
+        if msgs:
+            _inject_queues[session_id] = []
+        return msgs
+
+
+def mark_draining(session_id: str):
+    """Mark session as draining (no new injects accepted).
+    Called from main.py on BrokenPipeError before background drain."""
+    if not session_id:
+        return
+    with _inject_lock:
+        _inject_queues.pop(session_id, None)
+
+
 # Web search tool definitions — extracted so _build_web_search_tools() can compose them per mode
 _TOOL_WEB_SEARCH = {
     "type": "function",
@@ -253,314 +305,8 @@ def _build_web_search_tools(search_mode: str, user_model: str) -> list:
         return [_TOOL_WEB_SEARCH, _TOOL_WEB_SEARCH_KIMI, _TOOL_WEB_SEARCH_CLAUDE]
 
 
-# Built-in system tools — available in Core mode alongside module tools
-BUILTIN_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "system__bash",
-            "description": "Execute a bash shell command on the Pi and return stdout + stderr. Use for system tasks, file operations, service management, etc.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "The bash command to execute"},
-                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 30)", "default": 30},
-                },
-                "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "system__python",
-            "description": "Execute a Python script on the Pi and return its output. Write the full script content, it will be saved to a temp file and run.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "code": {"type": "string", "description": "Complete Python script to execute"},
-                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 30)", "default": 30},
-                },
-                "required": ["code"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "system__write_file",
-            "description": "Write content to a file on the Pi filesystem.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Absolute path of the file to write"},
-                    "content": {"type": "string", "description": "Content to write"},
-                },
-                "required": ["path", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "system__read_file",
-            "description": "Read the content of a file on the Pi filesystem.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Absolute path of the file to read"},
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "system__ssh",
-            "description": "Execute a command on a remote server via SSH with password authentication. Use for server audits, remote administration, checking services on external hosts. sshpass must be installed on the Pi.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "host": {"type": "string", "description": "Remote hostname or IP address"},
-                    "user": {"type": "string", "description": "SSH username"},
-                    "password": {"type": "string", "description": "SSH password"},
-                    "command": {"type": "string", "description": "Shell command to execute on the remote host"},
-                    "port": {"type": "integer", "description": "SSH port (default 22)", "default": 22},
-                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 30)", "default": 30},
-                },
-                "required": ["host", "user", "password", "command"],
-            },
-        },
-    },
-    # Web search tools are injected dynamically via _build_web_search_tools() based on search_mode
-    # _TOOL_WEB_SEARCH, _TOOL_WEB_SEARCH_KIMI, _TOOL_WEB_SEARCH_CLAUDE defined above
-    {
-        "type": "function",
-        "function": {
-            "name": "system__search_engines_list",
-            "description": "List all search engines in the pool with their reliability scores and supported regions. Use to audit the search engine pool.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "system__search_engine_add",
-            "description": "Add a new search engine to the pool. Provide name, URL template (use {query} placeholder), regions, language, and optional headers/patterns. After adding, use system__search_engine_test to validate.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Unique engine identifier (e.g. 'google', 'yandex', 'naver')"},
-                    "url": {"type": "string", "description": "Search URL with {query} placeholder (e.g. https://www.google.com/search?q={query})"},
-                    "regions": {"type": "array", "items": {"type": "string"}, "description": "Country codes where this engine works (e.g. ['FR','US'] or ['OTHER'] for global)"},
-                    "language": {"type": "string", "description": "Primary language: 'any', 'zh', 'fr', 'en', 'ru', 'ja', 'ko'"},
-                    "headers": {"type": "object", "description": "HTTP headers (User-Agent, Accept-Language, etc.)"},
-                    "patterns": {"type": "object", "description": "Regex patterns — if unknown, leave empty and run test to auto-generate"},
-                },
-                "required": ["name", "url"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "system__search_engine_test",
-            "description": "Test a search engine and auto-fix its patterns via AI if it returns 0 results. Updates reliability score. Run after adding a new engine.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Engine name to test"},
-                    "query": {"type": "string", "description": "Test query (default: 'test search engine')"},
-                },
-                "required": ["name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "system__spawn_agents",
-            "description": (
-                "Run multiple sub-agents in parallel on independent tasks and collect their results. "
-                "Use when a complex request can be decomposed into independent subtasks handled by different specialists. "
-                "Each agent works autonomously — do NOT use for sequential tasks that depend on each other. "
-                "Returns the combined output of all agents."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "tasks": {
-                        "type": "array",
-                        "description": "List of independent tasks to run in parallel",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "agent": {"type": "string", "description": "Agent ID to assign this task to"},
-                                "task": {"type": "string", "description": "Full task description for this agent — be specific and self-contained"},
-                            },
-                            "required": ["agent", "task"],
-                        },
-                    },
-                    "timeout": {"type": "integer", "description": "Max seconds to wait per agent (default 120)", "default": 120},
-                },
-                "required": ["tasks"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "system__handoff",
-            "description": (
-                "Transfer a specific sub-task to a specialist agent. Use ONLY when the task requires "
-                "expertise outside your specialization. Write a COMPACT, self-contained brief — "
-                "the target agent has NO access to the conversation history. "
-                "Rules: (1) context = only what the target agent strictly needs to know, as short as possible. "
-                "(2) task = precise actionable instruction. (3) expected_output = exact format you need back. "
-                "Do NOT use for tasks you can handle yourself."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "agent_id": {"type": "string", "description": "ID of the target agent (e.g. 'julien', 'marc', 'sophie', 'thierry')"},
-                    "task": {"type": "string", "description": "Precise, actionable instruction — self-contained, no assumed context"},
-                    "context": {"type": "string", "description": "Minimal background the agent needs. Summarize only what is strictly necessary."},
-                    "expected_output": {"type": "string", "description": "Exact format or content you need back (e.g. 'the file content as text', 'a list of IPs', 'a working Python function')"},
-                },
-                "required": ["agent_id", "task"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "system__schedule_task",
-            "description": (
-                "Schedule a task to run automatically at a specified time or recurrence. "
-                "Use when the user asks to schedule, automate, plan, or set a reminder for a recurring or one-time action. "
-                "Supports: once (exact datetime), daily (every day at HH:MM), weekly (day + time), "
-                "hourly (every hour at :MM), interval (every N minutes)."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Short human-readable name for the task"},
-                    "instruction": {"type": "string", "description": "Full instruction to execute when the task runs (as if the user typed it)"},
-                    "schedule_type": {
-                        "type": "string",
-                        "enum": ["once", "daily", "weekly", "hourly", "interval"],
-                        "description": "Type of schedule",
-                    },
-                    "datetime": {"type": "string", "description": "ISO 8601 datetime for 'once' type (e.g. '2025-12-25T09:00:00')"},
-                    "time": {"type": "string", "description": "Time HH:MM for 'daily' or 'weekly' (e.g. '09:30')"},
-                    "day_of_week": {"type": "string", "description": "Day of week for 'weekly' in English or French (e.g. 'monday', 'lundi')"},
-                    "minute": {"type": "integer", "description": "Minute of the hour for 'hourly' (0-59)"},
-                    "interval_minutes": {"type": "integer", "description": "Interval in minutes for 'interval' type"},
-                },
-                "required": ["name", "instruction", "schedule_type"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "system__list_tasks",
-            "description": "List all scheduled tasks with their status, next run time, and recent execution history.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "system__cancel_task",
-            "description": "Cancel (delete) or pause a scheduled task by its ID.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task_id": {"type": "string", "description": "The task ID to cancel (8-char string)"},
-                    "action": {
-                        "type": "string",
-                        "enum": ["delete", "pause"],
-                        "description": "delete = permanent removal, pause = temporary suspension. Default: delete",
-                        "default": "delete",
-                    },
-                },
-                "required": ["task_id"],
-            },
-        },
-    },
-    # ── FILES module ────────────────────────────────────────────────────────
-    {"type": "function", "function": {"name": "files__read", "description": "Read the content of a file on the Pi filesystem.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute path of the file to read"}}, "required": ["path"]}}},
-    {"type": "function", "function": {"name": "files__write", "description": "Write content to a file atomically (write .tmp then rename). Creates parent directories if needed.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute path of the file to write"}, "content": {"type": "string", "description": "Content to write"}, "force": {"type": "boolean", "description": "Allow writing to system paths like /etc/ (default false)", "default": False}}, "required": ["path", "content"]}}},
-    {"type": "function", "function": {"name": "files__list", "description": "List files and directories at a given path with size and modification time.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Directory path to list"}, "recursive": {"type": "boolean", "description": "List recursively (default false)", "default": False}}, "required": ["path"]}}},
-    {"type": "function", "function": {"name": "files__move", "description": "Move or rename a file or directory.", "parameters": {"type": "object", "properties": {"src": {"type": "string", "description": "Source path"}, "dst": {"type": "string", "description": "Destination path"}}, "required": ["src", "dst"]}}},
-    {"type": "function", "function": {"name": "files__delete", "description": "Delete a file or empty directory.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Path to delete"}, "recursive": {"type": "boolean", "description": "Delete directory recursively (default false)", "default": False}}, "required": ["path"]}}},
-    {"type": "function", "function": {"name": "files__dir_create", "description": "Create a directory and all parent directories.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Directory path to create"}}, "required": ["path"]}}},
-    # ── DOCUMENTS module ─────────────────────────────────────────────────────
-    {"type": "function", "function": {"name": "documents__pdf_to_text", "description": "Extract plain text from a PDF file using pdftotext (poppler).", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute path to the PDF file"}}, "required": ["path"]}}},
-    {"type": "function", "function": {"name": "documents__csv_parse", "description": "Parse a CSV file and return its content as a JSON array of objects.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute path to the CSV file"}, "delimiter": {"type": "string", "description": "Field delimiter (default ',')", "default": ","}, "max_rows": {"type": "integer", "description": "Maximum rows to return (default 100)", "default": 100}}, "required": ["path"]}}},
-    # ── WEB module ───────────────────────────────────────────────────────────
-    {"type": "function", "function": {"name": "web__search", "description": "Search the web using Bing/DuckDuckGo and return top results with titles, URLs, and snippets.", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Search query"}, "max_results": {"type": "integer", "description": "Max results (default 5, max 10)", "default": 5}}, "required": ["query"]}}},
-    {"type": "function", "function": {"name": "web__http_get", "description": "Perform an HTTP GET request and return the response body.", "parameters": {"type": "object", "properties": {"url": {"type": "string", "description": "Target URL"}, "headers": {"type": "object", "description": "Optional HTTP headers as key-value pairs"}, "timeout": {"type": "integer", "description": "Timeout in seconds (default 30)", "default": 30}}, "required": ["url"]}}},
-    {"type": "function", "function": {"name": "web__http_post", "description": "Perform an HTTP POST request with a JSON body and return the response.", "parameters": {"type": "object", "properties": {"url": {"type": "string", "description": "Target URL"}, "body": {"type": "object", "description": "JSON body to send"}, "headers": {"type": "object", "description": "Optional HTTP headers"}, "timeout": {"type": "integer", "description": "Timeout in seconds (default 30)", "default": 30}}, "required": ["url", "body"]}}},
-    {"type": "function", "function": {"name": "web__file_download", "description": "Download a file from a URL and save it to the Pi filesystem.", "parameters": {"type": "object", "properties": {"url": {"type": "string", "description": "URL to download"}, "dest": {"type": "string", "description": "Absolute destination path on the Pi"}, "timeout": {"type": "integer", "description": "Timeout in seconds (default 60)", "default": 60}}, "required": ["url", "dest"]}}},
-    # ── EXEC module ──────────────────────────────────────────────────────────
-    {"type": "function", "function": {"name": "exec__run_python", "description": "Execute a Python script in a sandboxed environment. Working directory: /tmp/clawbot-agent/. Use for agent-authored scripts that should not run as root.", "parameters": {"type": "object", "properties": {"code": {"type": "string", "description": "Complete Python script to execute"}, "timeout": {"type": "integer", "description": "Timeout in seconds (default 60)", "default": 60}}, "required": ["code"]}}},
-    {"type": "function", "function": {"name": "exec__run_bash", "description": "Execute a bash script in a sandboxed environment. Working directory: /tmp/clawbot-agent/. Use for agent-authored scripts that should not run as root.", "parameters": {"type": "object", "properties": {"script": {"type": "string", "description": "Bash script to execute"}, "timeout": {"type": "integer", "description": "Timeout in seconds (default 60)", "default": 60}}, "required": ["script"]}}},
-    # ── EMAIL module ─────────────────────────────────────────────────────────
-    {"type": "function", "function": {"name": "email__send", "description": "Send an email via SMTP. Config must be set in /home/pi/.openjarvis/email.json (smtp_host, smtp_port, user, password, from_name).", "parameters": {"type": "object", "properties": {"to": {"type": "string", "description": "Recipient email address"}, "subject": {"type": "string", "description": "Email subject"}, "body": {"type": "string", "description": "Email body (plain text)"}, "cc": {"type": "string", "description": "Optional CC address"}}, "required": ["to", "subject", "body"]}}},
-    # ── GIT module ───────────────────────────────────────────────────────────
-    {"type": "function", "function": {"name": "git__status", "description": "Get the git status of a repository: current branch, staged and unstaged changes.", "parameters": {"type": "object", "properties": {"repo_path": {"type": "string", "description": "Absolute path to the git repository"}}, "required": ["repo_path"]}}},
-    {"type": "function", "function": {"name": "git__commit", "description": "Stage all changes (git add -A) and create a commit in a git repository.", "parameters": {"type": "object", "properties": {"repo_path": {"type": "string", "description": "Absolute path to the git repository"}, "message": {"type": "string", "description": "Commit message"}}, "required": ["repo_path", "message"]}}},
-    {"type": "function", "function": {"name": "git__push", "description": "Push commits to the remote repository. Optionally set remote and branch.", "parameters": {"type": "object", "properties": {"repo_path": {"type": "string", "description": "Absolute path to the git repository"}, "remote": {"type": "string", "description": "Remote name (default 'origin')", "default": "origin"}, "branch": {"type": "string", "description": "Branch name (default: current branch)"}}, "required": ["repo_path"]}}},
-    # ── SYSTEM extended module ───────────────────────────────────────────────
-    {"type": "function", "function": {"name": "system__get_system_info", "description": "Get system information about the Pi: CPU usage, RAM, disk, temperature, hostname, IP addresses.", "parameters": {"type": "object", "properties": {}}}},
-    {"type": "function", "function": {"name": "system__ssh_execute", "description": "Execute a command on a remote server via SSH with password authentication.", "parameters": {"type": "object", "properties": {"host": {"type": "string"}, "user": {"type": "string"}, "password": {"type": "string"}, "command": {"type": "string"}, "port": {"type": "integer", "default": 22}, "timeout": {"type": "integer", "default": 30}}, "required": ["host", "user", "password", "command"]}}},
-    {"type": "function", "function": {"name": "system__disk", "description": "Get disk usage for all mounted filesystems on the Pi (df -h output).", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Optional specific path to check (default: '/')", "default": "/"}}}}},
-    # ── GIT extended ─────────────────────────────────────────────────────────
-    {"type": "function", "function": {"name": "git__pull", "description": "Pull latest changes from remote into a git repository.", "parameters": {"type": "object", "properties": {"repo_path": {"type": "string", "description": "Absolute path to the git repository"}, "remote": {"type": "string", "description": "Remote name (default 'origin')", "default": "origin"}, "branch": {"type": "string", "description": "Branch to pull (default: current branch)"}}, "required": ["repo_path"]}}},
-    {"type": "function", "function": {"name": "git__log", "description": "Show recent commit history of a git repository.", "parameters": {"type": "object", "properties": {"repo_path": {"type": "string", "description": "Absolute path to the git repository"}, "n": {"type": "integer", "description": "Number of commits to show (default 10)", "default": 10}}, "required": ["repo_path"]}}},
-    # ── DOCUMENTS extended ────────────────────────────────────────────────────
-    {"type": "function", "function": {"name": "documents__csv_write", "description": "Write a JSON array of objects to a CSV file.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute path to write the CSV file"}, "data": {"type": "array", "description": "Array of objects to write as CSV rows", "items": {"type": "object"}}, "delimiter": {"type": "string", "description": "Field delimiter (default ',')", "default": ","}}, "required": ["path", "data"]}}},
-    # ── AGENTS module (alias for system__handoff / system__spawn_agents) ──────
-    {"type": "function", "function": {"name": "agents__delegate", "description": "Delegate a sub-task to a specialist agent (alias for system__handoff). Use when a task requires expertise outside your specialization.", "parameters": {"type": "object", "properties": {"agent_id": {"type": "string", "description": "ID of the target agent"}, "task": {"type": "string", "description": "Precise, actionable instruction — self-contained"}, "context": {"type": "string", "description": "Minimal background the agent needs"}, "expected_output": {"type": "string", "description": "Exact format or content you need back"}}, "required": ["agent_id", "task"]}}},
-    # ── SCHEDULER module (aliases for system__schedule_task / list / cancel) ──
-    {"type": "function", "function": {"name": "scheduler__create", "description": "Schedule a task to run automatically at a specified time or recurrence (alias for system__schedule_task).", "parameters": {"type": "object", "properties": {"name": {"type": "string", "description": "Short human-readable name for the task"}, "instruction": {"type": "string", "description": "Full instruction to execute when the task runs"}, "schedule_type": {"type": "string", "enum": ["once", "daily", "weekly", "hourly", "interval"]}, "datetime": {"type": "string", "description": "ISO 8601 datetime for 'once' type"}, "time": {"type": "string", "description": "Time HH:MM for 'daily' or 'weekly'"}, "day_of_week": {"type": "string", "description": "Day of week for 'weekly'"}, "minute": {"type": "integer", "description": "Minute of the hour for 'hourly'"}, "interval_minutes": {"type": "integer", "description": "Interval in minutes for 'interval' type"}}, "required": ["name", "instruction", "schedule_type"]}}},
-    {"type": "function", "function": {"name": "scheduler__list", "description": "List all scheduled tasks with their status and next run time.", "parameters": {"type": "object", "properties": {}}}},
-    {"type": "function", "function": {"name": "scheduler__cancel", "description": "Cancel (delete) or pause a scheduled task by its ID.", "parameters": {"type": "object", "properties": {"task_id": {"type": "string", "description": "Task ID to cancel"}, "action": {"type": "string", "enum": ["delete", "pause"], "default": "delete"}}, "required": ["task_id"]}}},
-    # ── FILES aliases ─────────────────────────────────────────────────────────
-    {"type": "function", "function": {"name": "files__mkdir", "description": "Create a directory and all parent directories (alias for files__dir_create).", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Directory path to create"}}, "required": ["path"]}}},
-    # ── VAULT module ──────────────────────────────────────────────────────────
-    {"type": "function", "function": {"name": "vault__store", "description": "Store a secret (API key, password, token) securely in the encrypted vault. Use this instead of writing credentials to config files.", "parameters": {"type": "object", "properties": {"name": {"type": "string", "description": "Unique identifier for the secret (e.g. 'ionos_smtp', 'anthropic_api')"}, "value": {"type": "string", "description": "The secret value to store (will be encrypted at rest)"}, "username": {"type": "string", "description": "Optional username/login associated with this secret (e.g. 'nicolas@3d-expert.fr')", "default": ""}, "category": {"type": "string", "description": "Optional category: 'llm', 'email', 'ssh', 'api', 'oauth', 'other'", "default": "other"}, "note": {"type": "string", "description": "Optional note (e.g. 'IONOS SMTP server smtp.ionos.com port 587')", "default": ""}}, "required": ["name", "value"]}}},
-    {"type": "function", "function": {"name": "vault__get", "description": "Retrieve a secret from the encrypted vault by name. Returns the decrypted value.", "parameters": {"type": "object", "properties": {"name": {"type": "string", "description": "The name of the secret to retrieve"}}, "required": ["name"]}}},
-    {"type": "function", "function": {"name": "vault__list", "description": "List all stored secrets by name and category. Does NOT reveal secret values for security.", "parameters": {"type": "object", "properties": {"category": {"type": "string", "description": "Filter by category (optional). Omit to list all."}}}}},
-    {"type": "function", "function": {"name": "vault__delete", "description": "Delete a secret from the vault by name.", "parameters": {"type": "object", "properties": {"name": {"type": "string", "description": "The name of the secret to delete"}}, "required": ["name"]}}},
-    {"type": "function", "function": {"name": "vault__flag_secret", "description": "Flag a secret in the conversation that is not yet protected. Call this when you see a raw password, API key, or credential. The system will protect, mask it, and learn the pattern for future detection. IMPORTANT: Always provide a pattern_hint regex if the secret has a recognizable format.", "parameters": {"type": "object", "properties": {"value": {"type": "string", "description": "The exact secret value"}, "suggested_name": {"type": "string", "description": "Name for the secret (e.g. 'replicate_api_key')"}, "category": {"type": "string", "description": "llm/email/ssh/api/other", "default": "other"}, "pattern_hint": {"type": "string", "description": "Regex pattern for this type of secret (e.g. 'r8_[a-zA-Z0-9]{30,}' for Replicate keys). Omit for arbitrary passwords with no recognizable format."}}, "required": ["value", "suggested_name"]}}},
-    {"type": "function", "function": {"name": "vault__protect_pii", "description": "Protect personal data (name, address, phone...) from being sent to AI. The value will be replaced by an alias in all future messages.", "parameters": {"type": "object", "properties": {"name": {"type": "string", "description": "Identifier (e.g. 'my_name', 'home_address')"}, "value": {"type": "string", "description": "The personal data to protect"}, "category": {"type": "string", "description": "name/address/phone/email/other", "default": "other"}}, "required": ["name", "value"]}}},
-    {"type": "function", "function": {"name": "vault__search", "description": "Search vault secrets by keyword. Matches against name, username, category and note. Use this FIRST to find the right credential before vault__get. Returns matching entries without values.", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Search keyword (e.g. 'ionos', 'smtp', 'nicolas', 'ssh')"}}, "required": ["query"]}}},
-]
-
-# ── Agent memory tools (only added when memory_enabled=true) ─────────────────
-AGENT_MEMORY_TOOLS = [
-    {"type": "function", "function": {
-        "name": "memory__save",
-        "description": "Save an important fact to your persistent memory. This survives across all sessions and all interfaces (dashboard, Cowork, mobile). Use when the user tells you something important: your name/identity, their preferences, project context, corrections.",
-        "parameters": {"type": "object", "properties": {
-            "key": {"type": "string", "description": "Short label for this fact (e.g. 'my_full_name', 'user_company', 'preferred_language')"},
-            "value": {"type": "string", "description": "The fact to remember"}
-        }, "required": ["key", "value"]}}},
-    {"type": "function", "function": {
-        "name": "memory__read",
-        "description": "Read all your persistent memory facts.",
-        "parameters": {"type": "object", "properties": {}}}},
-    {"type": "function", "function": {
-        "name": "memory__delete",
-        "description": "Delete a specific fact from your persistent memory.",
-        "parameters": {"type": "object", "properties": {
-            "key": {"type": "string", "description": "The key to forget"}
-        }, "required": ["key"]}}},
-]
+# Built-in tool schemas loaded from tool_registry.py
+BUILTIN_TOOLS = get_builtin_tools()
 
 # Context compaction — triggered when estimated input tokens exceed threshold
 COMPACT_THRESHOLD = 15000   # estimated tokens (~chars/4) before compaction
@@ -599,10 +345,11 @@ def _load_llm_config() -> tuple[str, str, str]:
     model = cfg.get("model", "")
     # Vault override for API key
     try:
-        from vault import Vault
-        vkey = Vault().get("llm_api_key")
-        if vkey:
-            key = vkey
+        v = _get_vault()
+        if v:
+            vkey = v.get("llm_api_key")
+            if vkey:
+                key = vkey
     except Exception:
         pass
     if base and key:
@@ -661,10 +408,11 @@ def _load_kimi_config() -> tuple:
     base = cfg.get("baseurl", "").rstrip("/")
     key = cfg.get("apikey", "")
     try:
-        from vault import Vault
-        vkey = Vault().get("llm_api_key")
-        if vkey:
-            key = vkey
+        v = _get_vault()
+        if v:
+            vkey = v.get("llm_api_key")
+            if vkey:
+                key = vkey
     except Exception:
         pass
     if "kimi" in base and key:
@@ -680,10 +428,11 @@ def _load_anthropic_config() -> tuple:
     key = cfg.get("apikey", "")
     model = cfg.get("model", "")
     try:
-        from vault import Vault
-        vkey = Vault().get("llm_api_key")
-        if vkey:
-            key = vkey
+        v = _get_vault()
+        if v:
+            vkey = v.get("llm_api_key")
+            if vkey:
+                key = vkey
     except Exception:
         pass
     if "anthropic.com" in base and key:
@@ -957,7 +706,10 @@ def chat_with_tools(request_body: dict, override_tools: list = None, agent_id: s
         _search_mode = _load_core_prompts().get("search_mode", "auto")
         _current_model = request_body.get("model", "")
         _web_tools = _build_web_search_tools(_search_mode, _current_model)
-        _non_web_builtins = [t for t in BUILTIN_TOOLS if t.get("function", {}).get("name") not in _WEB_SEARCH_TOOL_NAMES]
+        _vault_off = not _is_vault_enabled()
+        _non_web_builtins = [t for t in BUILTIN_TOOLS
+                             if t.get("function", {}).get("name") not in _WEB_SEARCH_TOOL_NAMES
+                             and not (_vault_off and t.get("function", {}).get("name", "").startswith("vault__"))]
         tools = _web_tools + _non_web_builtins + module_tools
 
     # Patch spawn_agents tool: inject actual available agent IDs so LLM doesn't hallucinate names
@@ -1039,29 +791,8 @@ def chat_with_tools(request_body: dict, override_tools: list = None, agent_id: s
         # Append assistant message with tool_calls to history
         body["messages"].append(choice["message"])
 
-        # Sandbox check (sync path — no interactive approval, ASK→auto-deny)
-        _plan = request_body.get("plan", "free")
-        executable_tcs = []
-        for tc in tool_calls:
-            fn = tc.get("function", {})
-            tool_name = fn.get("name", "")
-            tc_id = tc.get("id", "")
-            try:
-                args = json.loads(fn.get("arguments", "{}"))
-            except Exception:
-                args = {}
-            perm, reason = _sandbox.evaluate(tool_name, args, plan=_plan)
-            if perm == ToolPermission.DENY:
-                log.warning("Sandbox DENY (sync): %s — %s", tool_name, reason)
-                body["messages"].append({"role": "tool", "tool_call_id": tc_id, "content": f"[blocked] {reason}"})
-            elif perm == ToolPermission.ASK:
-                log.info("Sandbox ASK (sync, no UI) → auto-deny: %s", tool_name)
-                body["messages"].append({"role": "tool", "tool_call_id": tc_id, "content": "[blocked] Requires user approval (not available in sync mode)"})
-            else:
-                executable_tcs.append(tc)
-
-        if not executable_tcs:
-            continue
+        # All tools allowed — sandbox disabled (to be reimplemented with UI)
+        executable_tcs = list(tool_calls)
 
         # Execute cleared tool calls in parallel when multiple are requested
         _user_model = body.get("model")
@@ -1119,7 +850,10 @@ def chat_with_tools_stream(request_body: dict, override_tools: list = None, sess
         _search_mode = _load_core_prompts().get("search_mode", "auto")
         _current_model = request_body.get("model", "")
         _web_tools = _build_web_search_tools(_search_mode, _current_model)
-        _non_web_builtins = [t for t in BUILTIN_TOOLS if t.get("function", {}).get("name") not in _WEB_SEARCH_TOOL_NAMES]
+        _vault_off = not _is_vault_enabled()
+        _non_web_builtins = [t for t in BUILTIN_TOOLS
+                             if t.get("function", {}).get("name") not in _WEB_SEARCH_TOOL_NAMES
+                             and not (_vault_off and t.get("function", {}).get("name", "").startswith("vault__"))]
         tools = _web_tools + _non_web_builtins + module_tools
 
     body = dict(request_body)
@@ -1154,7 +888,10 @@ def chat_with_tools_stream(request_body: dict, override_tools: list = None, sess
             "3. If you see a raw credential NOT explicitly shared by the user (e.g. leaked in a tool result), "
             "call vault__flag_secret immediately. Include a pattern_hint regex if the key has a "
             "recognizable prefix (e.g. 'r8_[a-zA-Z0-9]{30,}' for Replicate).\n"
-            "4. NEVER reveal the real value behind an alias. NEVER echo back passwords in your response."
+            "4. NEVER reveal the real value behind an alias. NEVER echo back passwords in your response.\n"
+            "5. When the user shares a TOTP/2FA secret (base32 key or otpauth:// URI), "
+            "call vault__totp_add to store it securely. Ask the user for a name if not obvious. "
+            "NEVER store TOTP secrets via vault__store or vault__flag_secret — always use vault__totp_add."
         )
         if system_content.strip():
             body["messages"] = [{"role": "system", "content": system_content}] + messages
@@ -1184,6 +921,7 @@ def chat_with_tools_stream(request_body: dict, override_tools: list = None, sess
 
     # ── VaultProxy: auto-detect new secrets then mask all protected values ────
     _vault = _get_vault()
+    _totp_hints_all = []
     if _vault:
         _auto_names = []
         for _msg in body.get("messages", []):
@@ -1191,15 +929,17 @@ def chat_with_tools_stream(request_body: dict, override_tools: list = None, sess
                 continue
             _c = _msg.get("content", "")
             if isinstance(_c, str):
-                _masked, _names = _vault.auto_protect(_c)
+                _masked, _names, _totp_h = _vault.auto_protect(_c)
                 _msg["content"] = _masked
                 _auto_names.extend(_names)
+                _totp_hints_all.extend(_totp_h)
             elif isinstance(_c, list):
                 for _part in _c:
                     if isinstance(_part, dict) and _part.get("type") == "text":
-                        _masked, _names = _vault.auto_protect(_part.get("text", ""))
+                        _masked, _names, _totp_h = _vault.auto_protect(_part.get("text", ""))
                         _part["text"] = _masked
                         _auto_names.extend(_names)
+                        _totp_hints_all.extend(_totp_h)
         if _auto_names:
             log.info("Auto-protected %d new values: %s", len(_auto_names), _auto_names)
             yield {"type": "vault_intercept", "secrets": _auto_names}
@@ -1214,6 +954,20 @@ def chat_with_tools_stream(request_body: dict, override_tools: list = None, sess
                 if _msg.get("role") == "user":
                     if isinstance(_msg.get("content"), str):
                         _msg["content"] += _hint
+                    break
+        # ── TOTP hint injection: tell LLM a TOTP secret was detected ──
+        if _totp_hints_all:
+            _totp_hint = (
+                "\n[SYSTEM HINT: A TOTP/2FA secret was detected in the user's message. "
+                "Ask the user if they want to store it as a TOTP entry for code generation. "
+                "If yes, call vault__totp_add with the appropriate name and secret. "
+                "Detected value(s): " +
+                ", ".join(h["value"][:20] + "..." for h in _totp_hints_all) + "]"
+            )
+            for _msg in reversed(body.get("messages", [])):
+                if _msg.get("role") == "user":
+                    if isinstance(_msg.get("content"), str):
+                        _msg["content"] += _totp_hint
                     break
         # Mask ALL messages (system, assistant, tool) for already-known values
         for _msg in body.get("messages", []):
@@ -1237,13 +991,23 @@ def chat_with_tools_stream(request_body: dict, override_tools: list = None, sess
     log.info("[MODEL] after resolve: body model=%s default=%s", body.get("model"), default_model)
     model_name = body.get("model", "Claude")
 
-    for round_num in range(MAX_TOOL_ROUNDS):
+    _register_inject_session(session_id)
+    try:
+      for round_num in range(MAX_TOOL_ROUNDS):
         # Check if user cancelled this session
         if is_cancelled(session_id):
             clear_cancelled(session_id)
             log.info("Session %s cancelled by user at round %d", session_id, round_num + 1)
             yield {"type": "done", "content": "⛔ Tâche arrêtée par l'utilisateur."}
             return
+
+        # ── Mid-stream inject drain ──────────────────────────────────
+        if round_num > 0:
+            injected = _drain_inject_queue(session_id)
+            for inj_msg in injected:
+                body["messages"].append({"role": "user", "content": inj_msg})
+                yield {"type": "user_injected", "content": inj_msg}
+                log.info("Mid-stream inject: session=%s msg=%s", session_id, inj_msg[:60])
 
         estimated = _estimate_tokens(body["messages"])
         yield {"type": "context_usage", "tokens": estimated, "max": COMPACT_THRESHOLD}
@@ -1296,6 +1060,18 @@ def chat_with_tools_stream(request_body: dict, override_tools: list = None, sess
                 return
 
         if finish != "tool_calls":
+            # ── Mid-stream inject: check before truly stopping ──
+            injected = _drain_inject_queue(session_id)
+            if injected:
+                # Append assistant partial + injected user messages, loop back
+                assistant_msg = choice.get("message", {})
+                if assistant_msg:
+                    body["messages"].append(assistant_msg)
+                for inj_msg in injected:
+                    body["messages"].append({"role": "user", "content": inj_msg})
+                    yield {"type": "user_injected", "content": inj_msg}
+                    log.info("Mid-stream inject on stop: session=%s msg=%s", session_id, inj_msg[:60])
+                continue  # loop back — LLM will see the injected messages
             content = (choice.get("message", {}).get("content") or "").strip().replace("\U0001F99E", "")
             # VaultProxy: mask any leaked values in final response
             if _vault:
@@ -1305,6 +1081,17 @@ def chat_with_tools_stream(request_body: dict, override_tools: list = None, sess
 
         tool_calls = choice.get("message", {}).get("tool_calls", [])
         if not tool_calls:
+            # ── Mid-stream inject: check before truly stopping ──
+            injected = _drain_inject_queue(session_id)
+            if injected:
+                assistant_msg = choice.get("message", {})
+                if assistant_msg:
+                    body["messages"].append(assistant_msg)
+                for inj_msg in injected:
+                    body["messages"].append({"role": "user", "content": inj_msg})
+                    yield {"type": "user_injected", "content": inj_msg}
+                    log.info("Mid-stream inject on stop: session=%s msg=%s", session_id, inj_msg[:60])
+                continue
             content = (choice.get("message", {}).get("content") or "").strip().replace("\U0001F99E", "")
             if _vault:
                 content = _vault.mask(content)
@@ -1333,55 +1120,9 @@ def chat_with_tools_stream(request_body: dict, override_tools: list = None, sess
 
         body["messages"].append(choice["message"])
 
-        # ── Sandbox permission check ─────────────────────────────────
-        # Evaluate each tool BEFORE execution. DENY → immediate error,
-        # ASK → emit approval_request SSE event and wait for user decision.
-        _plan = request_body.get("plan", "free")
-        executable_tcs = []     # tools cleared to run (ALLOW or approved ASK)
+        # All tools allowed — sandbox disabled (to be reimplemented with UI)
+        executable_tcs = list(tool_calls)
         results_list = []
-
-        for tc in tool_calls:
-            fn = tc.get("function", {})
-            tool_name = fn.get("name", "")
-            tc_id = tc.get("id", "")
-            try:
-                args = json.loads(fn.get("arguments", "{}"))
-            except Exception:
-                args = {}
-
-            perm, reason = _sandbox.evaluate(tool_name, args, session_id, plan=_plan)
-
-            if perm == ToolPermission.DENY:
-                log.warning("Sandbox DENY: %s — %s", tool_name, reason)
-                deny_result = f"[blocked] {reason}"
-                results_list.append({"name": tool_name, "result": deny_result})
-                body["messages"].append({"role": "tool", "tool_call_id": tc_id, "content": deny_result})
-                yield {"type": "tool_denied", "call_id": tc_id, "tool": tool_name, "reason": reason}
-
-            elif perm == ToolPermission.ASK:
-                # Emit approval request and block until user responds
-                yield {"type": "tool_approval_request", "call_id": tc_id,
-                       "tool": tool_name, "args": args, "reason": reason}
-                ev = request_approval(tc_id)
-                answered = ev.wait(timeout=_APPROVAL_TIMEOUT)
-                decision, remember = _pop_approval(tc_id)
-
-                if not answered or decision != "allow":
-                    deny_reason = "Approval denied by user" if answered else "Approval timed out (120s)"
-                    log.info("Sandbox ASK → denied: %s — %s", tool_name, deny_reason)
-                    deny_result = f"[blocked] {deny_reason}"
-                    results_list.append({"name": tool_name, "result": deny_result})
-                    body["messages"].append({"role": "tool", "tool_call_id": tc_id, "content": deny_result})
-                    yield {"type": "tool_denied", "call_id": tc_id, "tool": tool_name, "reason": deny_reason}
-                else:
-                    log.info("Sandbox ASK → approved: %s (remember=%s)", tool_name, remember)
-                    _sandbox.record_decision(tool_name, ToolPermission.ALLOW,
-                                             remember=remember, session_id=session_id,
-                                             command=args.get("command"))
-                    executable_tcs.append(tc)
-            else:
-                # ALLOW
-                executable_tcs.append(tc)
 
         # ── Execute cleared tools ─────────────────────────────────────
         if executable_tcs:
@@ -1425,6 +1166,19 @@ def chat_with_tools_stream(request_body: dict, override_tools: list = None, sess
                 results_list.append({"name": name, "result": result})
                 body["messages"].append({"role": "tool", "tool_call_id": tc_id, "content": result})
 
+        # VaultProxy: deduplicate protected entries after vault__store
+        if _vault and any(r.get("name") == "vault__store" for r in results_list):
+            for tc in executable_tcs:
+                fn = tc.get("function", {})
+                if fn.get("name") == "vault__store":
+                    try:
+                        _args = json.loads(_vault.unmask(fn.get("arguments", "{}")))
+                        _sv = _args.get("value")
+                        if _sv:
+                            _vault.remove_duplicate_protected(_sv)
+                    except Exception:
+                        pass
+
         # VaultProxy: retroactive mask after any vault write created new protections
         _vault_write_tools = ("vault__flag_secret", "vault__protect_pii", "vault__store")
         if _vault and any(r.get("name") in _vault_write_tools for r in results_list):
@@ -1466,23 +1220,27 @@ def chat_with_tools_stream(request_body: dict, override_tools: list = None, sess
                 sse_results.append(r)
         yield {"type": "tool_result", "round": round_num + 1, "results": sse_results}
 
-    # Safety fallback after max rounds — force a summary response
-    log.warning("Reached max tool rounds (%d), forcing final summary", MAX_TOOL_ROUNDS)
-    yield {"type": "thinking", "message": "Preparing final response..."}
-    body.pop("tools", None)
-    body.pop("tool_choice", None)
-    # Inject explicit instruction to summarize rather than call more tools
-    body["messages"].append({
-        "role": "user",
-        "content": "[System: You have reached the maximum number of tool calls. Summarize what you have done and what was accomplished. If the task is incomplete, explain what remains and why.]"
-    })
-    response = _call_llm(body)
-    content = (response.get("choices", [{}])[0].get("message", {}).get("content") or "").strip().replace("\U0001F99E", "")
-    if not content:
-        content = "Task completed. Maximum tool rounds reached."
-    if _vault:
-        content = _vault.mask(content)
-    yield {"type": "done", "content": content}
+      # Safety fallback after max rounds — force a summary response
+      log.warning("Reached max tool rounds (%d), forcing final summary", MAX_TOOL_ROUNDS)
+      yield {"type": "thinking", "message": "Preparing final response..."}
+      body.pop("tools", None)
+      body.pop("tool_choice", None)
+      # Inject explicit instruction to summarize rather than call more tools
+      body["messages"].append({
+          "role": "user",
+          "content": "[System: You have reached the maximum number of tool calls. Summarize what you have done and what was accomplished. If the task is incomplete, explain what remains and why.]"
+      })
+      response = _call_llm(body)
+      content = (response.get("choices", [{}])[0].get("message", {}).get("content") or "").strip().replace("\U0001F99E", "")
+      if not content:
+          content = "Task completed. Maximum tool rounds reached."
+      if _vault:
+          content = _vault.mask(content)
+      yield {"type": "done", "content": content}
+    finally:
+      orphans = _unregister_inject_session(session_id)
+      if orphans:
+          log.warning("Orphaned inject messages for %s: %s", session_id, [m[:60] for m in orphans])
 
 
 def _call_llm_stream(body: dict):
@@ -1612,438 +1370,470 @@ def _call_llm(body: dict) -> dict:
         return _error_response(f"LLM API unreachable: {e}")
 
 
-_PROTECTED_SERVICES = {"clawbot-core", "nginx", "clawbot-cloud", "clawbot-status-api"}
-_BASH_BLOCKED_PATTERNS = [
-    # Prevent stopping/restarting/disabling the services that run ClawbotCore itself
-    "systemctl stop", "systemctl restart", "systemctl disable",
-    "systemctl kill", "systemctl mask", "service stop", "service restart",
-    "kill -9", "pkill clawbot",
-]
+
+# Dangerous command blocking removed — to be reimplemented with user-facing UI
 
 
-def _is_dangerous_command(cmd: str) -> str | None:
-    """Return a reason string if the command should be blocked, else None."""
-    cmd_lower = cmd.lower()
-    for pattern in _BASH_BLOCKED_PATTERNS:
-        if pattern in cmd_lower:
-            # Allow if targeting something other than protected services
-            hits_protected = any(svc in cmd_lower for svc in _PROTECTED_SERVICES)
-            if hits_protected:
-                return f"Blocked: '{pattern}' on a protected ClawbotOS service"
-    return None
+# ── Built-in sub-handlers ──────────────────────────────────────────────────────
+# Each _builtin_* function handles one system__ tool suffix.
+# Uniform signature: (arguments: dict, user_model: str = None) -> str
+
+
+def _builtin_bash(arguments: dict, user_model: str = None) -> str:
+    cmd = arguments.get("command", "")
+    if not cmd:
+        return '[error] Missing required argument "command". Call system__bash with: {"command": "your shell command here"}'
+    timeout = int(arguments.get("timeout", 30))
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=timeout,
+            env={**os.environ, "HOME": "/home/pi"},
+        )
+        out = result.stdout + result.stderr
+        return out.strip() or "(no output)"
+    except subprocess.TimeoutExpired:
+        return f"[error] Command timed out after {timeout}s"
+    except Exception as e:
+        return f"[error] {e}"
+
+
+def _builtin_python(arguments: dict, user_model: str = None) -> str:
+    code = arguments.get("code", "")
+    if not code or not code.strip():
+        return '[error] Missing required argument "code". Call system__python with: {"code": "your complete Python script here"}'
+    timeout = int(arguments.get("timeout", 30))
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+            f.write(code)
+            tmp_path = f.name
+        result = subprocess.run(
+            ["python3", tmp_path], capture_output=True, text=True, timeout=timeout,
+            env={**os.environ, "HOME": "/home/pi"},
+        )
+        os.unlink(tmp_path)
+        out = result.stdout + result.stderr
+        return out.strip() or "(no output)"
+    except subprocess.TimeoutExpired:
+        return f"[error] Script timed out after {timeout}s"
+    except Exception as e:
+        return f"[error] {e}"
+
+
+def _builtin_write_file(arguments: dict, user_model: str = None) -> str:
+    path = arguments.get("path", "")
+    file_content = arguments.get("content")
+    if not path:
+        return '[error] Missing required argument "path". Call system__write_file with: {"path": "/absolute/path/to/file", "content": "file content here"}'
+    if file_content is None:
+        return '[error] Missing required argument "content". Call system__write_file with: {"path": "' + path + '", "content": "file content here"}'
+    file_content = str(file_content)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(file_content)
+        _connector_upload_bg(path)
+        return f"Written {len(file_content)} bytes to {path}"
+    except Exception as e:
+        return f"[error] {e}"
+
+
+def _builtin_read_file(arguments: dict, user_model: str = None) -> str:
+    path = arguments.get("path", "")
+    if not path:
+        return '[error] Missing required argument "path". Call system__read_file with: {"path": "/absolute/path/to/file"}'
+    try:
+        with open(path) as f:
+            file_content = f.read()
+        return file_content or "(empty file)"
+    except FileNotFoundError:
+        pulled = _connector_pull(path)
+        if pulled is not None:
+            return pulled
+        return f"[error] File not found: {path}"
+    except Exception as e:
+        return f"[error] {e}"
+
+
+def _builtin_web_search_kimi(arguments: dict, user_model: str = None) -> str:
+    query = arguments.get("query", "")
+    if not query:
+        return "[error] No query provided"
+    max_results = min(int(arguments.get("max_results", 5)), 10)
+    try:
+        return _web_search_kimi(query, max_results)
+    except Exception as e:
+        return f"[error] web_search_kimi: {e}"
+
+
+def _builtin_web_search_claude(arguments: dict, user_model: str = None) -> str:
+    query = arguments.get("query", "")
+    if not query:
+        return "[error] No query provided"
+    max_results = min(int(arguments.get("max_results", 5)), 10)
+    try:
+        return _web_search_claude(query, max_results)
+    except Exception as e:
+        return f"[error] web_search_claude: {e}"
+
+
+def _builtin_web_search(arguments: dict, user_model: str = None) -> str:
+    query = arguments.get("query", "")
+    if not query:
+        return "[error] No query provided"
+    max_results = min(int(arguments.get("max_results", 5)), 10)
+    try:
+        return _web_search(query, max_results, user_model=user_model)
+    except Exception as e:
+        return f"[error] Web search failed: {e}"
+
+
+def _builtin_ssh(arguments: dict, user_model: str = None) -> str:
+    import shutil
+    host = arguments.get("host", "")
+    user = arguments.get("user", "")
+    password = arguments.get("password", "")
+    command = arguments.get("command", "")
+    port = int(arguments.get("port", 22))
+    timeout = int(arguments.get("timeout", 30))
+    if not all([host, user, password, command]):
+        return "[error] Missing required SSH parameters: host, user, password, command"
+    if not shutil.which("sshpass"):
+        return "[error] sshpass not found — install with: apt-get install sshpass"
+    try:
+        result = subprocess.run(
+            ["sshpass", "-p", password, "ssh",
+             "-o", "StrictHostKeyChecking=no",
+             "-o", "ConnectTimeout=10",
+             "-p", str(port),
+             f"{user}@{host}", command],
+            capture_output=True, text=True, timeout=timeout,
+            env={**os.environ, "HOME": "/home/pi"},
+        )
+        out = result.stdout + result.stderr
+        return out.strip() or "(no output)"
+    except subprocess.TimeoutExpired:
+        return f"[error] SSH command timed out after {timeout}s"
+    except Exception as e:
+        return f"[error] {e}"
+
+
+def _builtin_spawn_agents(arguments: dict, user_model: str = None) -> str:
+    import threading
+    tasks = arguments.get("tasks", [])
+    agent_timeout = int(arguments.get("timeout", 120))
+    if not tasks:
+        return "[error] No tasks provided"
+    agents = load_agents()
+    results = {}
+    errors = {}
+
+    def _run_agent_task(agent_id: str, task_text: str):
+        if agent_id not in agents:
+            available = ", ".join(agents.keys()) or "none configured"
+            errors[agent_id] = f"Agent '{agent_id}' not found. Valid agent IDs: {available}"
+            return
+        body = {"messages": [{"role": "user", "content": task_text}]}
+        text_parts = []
+        try:
+            for event in chat_with_agent_stream(body, agent_id):
+                if event.get("type") == "text":
+                    text_parts.append(event.get("text", ""))
+                elif event.get("type") == "error":
+                    errors[agent_id] = event.get("message", "unknown error")
+                    return
+            results[agent_id] = "".join(text_parts).strip() or "(no output)"
+        except Exception as e:
+            errors[agent_id] = str(e)
+
+    threads = []
+    for item in tasks:
+        agent_id = item.get("agent", "")
+        task_text = item.get("task", "")
+        if not agent_id or not task_text:
+            continue
+        t = threading.Thread(target=_run_agent_task, args=(agent_id, task_text), daemon=True)
+        threads.append((agent_id, t))
+        t.start()
+
+    for agent_id, t in threads:
+        t.join(timeout=agent_timeout)
+        if t.is_alive():
+            errors[agent_id] = f"Timed out after {agent_timeout}s"
+
+    parts = []
+    for item in tasks:
+        aid = item.get("agent", "")
+        task = item.get("task", "")
+        agent_name = agents.get(aid, {}).get("name", aid) if aid in agents else aid
+        if aid in errors:
+            parts.append(f"### {agent_name}\n**Error:** {errors[aid]}")
+        else:
+            parts.append(f"### {agent_name}\n{results.get(aid, '(no response)')}")
+
+    return "\n\n".join(parts)
+
+
+def _builtin_schedule_task(arguments: dict, user_model: str = None) -> str:
+    from scheduler import create_task
+    name = arguments.get("name", "Unnamed task")
+    instruction = arguments.get("instruction", "")
+    schedule_type = arguments.get("schedule_type", "once")
+    if not instruction:
+        return "[error] No instruction provided"
+    kwargs = {k: v for k, v in arguments.items() if k not in ("name", "instruction", "schedule_type")}
+    try:
+        task = create_task(name, instruction, schedule_type, **kwargs)
+        return f"Task created: '{task['name']}' (id: {task['id']}) — next run: {task.get('next_run', 'N/A')}"
+    except Exception as e:
+        return f"[error] {e}"
+
+
+def _builtin_list_tasks(arguments: dict, user_model: str = None) -> str:
+    from scheduler import list_tasks
+    try:
+        tasks = list_tasks()
+        if not tasks:
+            return "No scheduled tasks."
+        lines = []
+        for t in tasks:
+            status = t.get("status", "unknown")
+            next_run = t.get("next_run") or "N/A"
+            last_run = t.get("last_run") or "never"
+            lines.append(
+                f"- [{t['id']}] {t['name']} | type: {t['schedule_type']} | "
+                f"status: {status} | next: {next_run} | last: {last_run}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"[error] {e}"
+
+
+def _builtin_cancel_task(arguments: dict, user_model: str = None) -> str:
+    from scheduler import delete_task, pause_task
+    task_id = arguments.get("task_id", "")
+    action = arguments.get("action", "delete")
+    if not task_id:
+        return "[error] No task_id provided"
+    try:
+        if action == "pause":
+            ok = pause_task(task_id)
+            return f"Task {task_id} paused." if ok else f"[error] Task {task_id} not found"
+        else:
+            ok = delete_task(task_id)
+            return f"Task {task_id} deleted." if ok else f"[error] Task {task_id} not found"
+    except Exception as e:
+        return f"[error] {e}"
+
+
+def _builtin_handoff(arguments: dict, user_model: str = None) -> str:
+    agent_id = arguments.get("agent_id", "")
+    task = arguments.get("task", "")
+    context = arguments.get("context", "")
+    expected_output = arguments.get("expected_output", "")
+    if not agent_id or not task:
+        return "[error] handoff requires agent_id and task"
+    agents = load_agents()
+    if agent_id not in agents:
+        available = ", ".join(agents.keys())
+        return f"[error] Unknown agent: '{agent_id}'. Available: {available}"
+    # Build structured handoff brief
+    parts = ["[HANDOFF BRIEF]"]
+    if context:
+        parts.append(f"Context: {context}")
+    parts.append(f"Task: {task}")
+    if expected_output:
+        parts.append(f"Expected output: {expected_output}")
+    parts.append("---\nRespond directly and concisely. No need to introduce yourself.")
+    handoff_msg = "\n".join(parts)
+    body = {"messages": [{"role": "user", "content": handoff_msg}], "model": "default"}
+    result_parts = []
+    try:
+        for ev in chat_with_agent_stream(body, agent_id):
+            if ev.get("type") == "done":
+                result_parts.append(ev.get("content", ""))
+            elif ev.get("type") == "text":
+                result_parts.append(ev.get("text", ""))
+    except Exception as e:
+        return f"[error] Handoff to '{agent_id}' failed: {e}"
+    agent_name = agents[agent_id].get("name", agent_id)
+    result = "".join(result_parts).strip() or "(no response)"
+    return f"[Handoff → {agent_name}]\n{result}"
+
+
+def _builtin_get_system_info(arguments: dict, user_model: str = None) -> str:
+    try:
+        import socket
+        lines = []
+        # Hostname
+        lines.append(f"hostname: {socket.gethostname()}")
+        # CPU usage
+        try:
+            with open("/proc/stat") as f:
+                cpu = f.readline().split()
+            idle = int(cpu[4])
+            total = sum(int(x) for x in cpu[1:])
+            lines.append(f"cpu_usage: {round(100 * (1 - idle / total), 1)}%")
+        except Exception:
+            pass
+        # RAM
+        try:
+            with open("/proc/meminfo") as f:
+                mem = {k.strip(): v.strip() for k, v in (l.split(":", 1) for l in f if ":" in l)}
+            total_kb = int(mem.get("MemTotal", "0 kB").split()[0])
+            avail_kb = int(mem.get("MemAvailable", "0 kB").split()[0])
+            used_kb = total_kb - avail_kb
+            lines.append(f"ram_total: {total_kb // 1024} MB")
+            lines.append(f"ram_used: {used_kb // 1024} MB ({round(100 * used_kb / total_kb, 1)}%)")
+        except Exception:
+            pass
+        # Temperature
+        try:
+            with open("/sys/class/thermal/thermal_zone0/temp") as f:
+                lines.append(f"cpu_temp: {int(f.read().strip()) / 1000:.1f}°C")
+        except Exception:
+            pass
+        # Disk
+        try:
+            r = subprocess.run(["df", "-h", "/"], capture_output=True, text=True, timeout=5)
+            parts = r.stdout.strip().splitlines()
+            if len(parts) > 1:
+                fields = parts[1].split()
+                lines.append(f"disk_total: {fields[1]}, disk_used: {fields[2]} ({fields[4]})")
+        except Exception:
+            pass
+        # IPs
+        try:
+            r = subprocess.run(["ip", "-brief", "addr"], capture_output=True, text=True, timeout=5)
+            for line in r.stdout.strip().splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and parts[0] != "lo" and parts[2]:
+                    lines.append(f"ip_{parts[0]}: {parts[2]}")
+        except Exception:
+            pass
+        return "\n".join(lines)
+    except Exception as e:
+        return f"[error] {e}"
+
+
+def _builtin_ssh_execute(arguments: dict, user_model: str = None) -> str:
+    # Alias of system__ssh for new naming
+    return _builtin_ssh(arguments, user_model=user_model)
+
+
+def _builtin_disk(arguments: dict, user_model: str = None) -> str:
+    path = arguments.get("path", "/")
+    try:
+        result = subprocess.run(
+            ["df", "-h", path], capture_output=True, text=True, timeout=10,
+            env={**os.environ, "HOME": "/home/pi"},
+        )
+        return result.stdout.strip() or result.stderr.strip() or "(no output)"
+    except Exception as e:
+        return f"[error] {e}"
+
+
+def _builtin_search_engines_list(arguments: dict, user_model: str = None) -> str:
+    engines = _load_search_engines()
+    lines = []
+    for name, cfg in sorted(engines.items(), key=lambda x: -x[1].get("reliability", 0.5)):
+        lines.append(f"- {name}: reliability={cfg.get('reliability',0.5):.2f} regions={cfg.get('regions',[])} lang={cfg.get('language','any')}")
+    return "Search engines pool:\n" + "\n".join(lines)
+
+
+def _builtin_search_engine_add(arguments: dict, user_model: str = None) -> str:
+    name = arguments.get("name", "").strip().lower()
+    url = arguments.get("url", "")
+    regions = arguments.get("regions", ["OTHER"])
+    language = arguments.get("language", "any")
+    headers = arguments.get("headers", {})
+    patterns = arguments.get("patterns", {})
+    if not name or not url:
+        return "[error] name and url are required"
+    engines = _load_search_engines()
+    engines[name] = {
+        "url": url,
+        "headers": headers or {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36"
+        },
+        "regions": regions,
+        "language": language,
+        "timeout": 10,
+        "reliability": 0.5,
+        "patterns": patterns,
+    }
+    _save_search_engines(engines)
+    return f"Engine '{name}' added to pool. Use system__search_engine_test to validate."
+
+
+def _builtin_search_engine_test(arguments: dict, user_model: str = None) -> str:
+    name = arguments.get("name", "")
+    query = arguments.get("query", "test search engine")
+    engines = _load_search_engines()
+    if name not in engines:
+        return f"[error] Engine '{name}' not found. Use system__search_engines_list."
+    cfg = engines[name]
+    try:
+        html_body = _fetch_search_html(cfg, query)
+        results = _parse_results(html_body, cfg.get("patterns", {}), 3)
+        if results:
+            cfg["reliability"] = min(1.0, cfg.get("reliability", 0.5) * 0.9 + 0.1)
+            engines[name] = cfg
+            _save_search_engines(engines)
+            return f"\u2713 Engine '{name}' working \u2014 {len(results)} results.\n\n" + "\n".join(results[:2])
+        # Try to adapt — use user_model if available
+        new_patterns = _adapt_engine_patterns(name, cfg, html_body, user_model=user_model)
+        if new_patterns:
+            cfg["patterns"] = new_patterns
+            results = _parse_results(html_body, new_patterns, 3)
+            if results:
+                cfg["reliability"] = 0.6
+                engines[name] = cfg
+                _save_search_engines(engines)
+                return f"\u2713 Engine '{name}' fixed by AI \u2014 {len(results)} results.\n\n" + "\n".join(results[:2])
+        cfg["reliability"] = max(0.1, cfg.get("reliability", 0.5) * 0.7)
+        engines[name] = cfg
+        _save_search_engines(engines)
+        return f"\u2717 Engine '{name}' returns 0 results. Patterns may need manual review."
+    except Exception as e:
+        cfg["reliability"] = max(0.1, cfg.get("reliability", 0.5) * 0.7)
+        engines[name] = cfg
+        _save_search_engines(engines)
+        return f"\u2717 Engine '{name}' failed: {e}"
+
+
+# ── Built-in sub-dispatch table ───────────────────────────────────────────────
+
+_BUILTIN_SUB_DISPATCH = {
+    "bash":                _builtin_bash,
+    "python":              _builtin_python,
+    "write_file":          _builtin_write_file,
+    "read_file":           _builtin_read_file,
+    "web_search_kimi":     _builtin_web_search_kimi,
+    "web_search_claude":   _builtin_web_search_claude,
+    "web_search":          _builtin_web_search,
+    "ssh":                 _builtin_ssh,
+    "spawn_agents":        _builtin_spawn_agents,
+    "schedule_task":       _builtin_schedule_task,
+    "list_tasks":          _builtin_list_tasks,
+    "cancel_task":         _builtin_cancel_task,
+    "handoff":             _builtin_handoff,
+    "get_system_info":     _builtin_get_system_info,
+    "ssh_execute":         _builtin_ssh_execute,
+    "disk":                _builtin_disk,
+    "search_engines_list": _builtin_search_engines_list,
+    "search_engine_add":   _builtin_search_engine_add,
+    "search_engine_test":  _builtin_search_engine_test,
+}
 
 
 def _execute_builtin(tool_suffix: str, arguments: dict, user_model: str = None) -> str:
     """Execute a built-in system tool directly (no HTTP call needed).
+    Dispatches to _builtin_* handlers via _BUILTIN_SUB_DISPATCH table.
     user_model: model name selected by user — propagated to web_search."""
-    timeout = int(arguments.get("timeout", 30))
-
-    if tool_suffix == "bash":
-        cmd = arguments.get("command", "")
-        if not cmd:
-            return '[error] Missing required argument "command". Call system__bash with: {"command": "your shell command here"}'
-        reason = _is_dangerous_command(cmd)
-        if reason:
-            log.warning("Blocked dangerous bash command: %s — %s", cmd[:80], reason)
-            return f"[blocked] {reason}"
-        try:
-            result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=timeout,
-                env={**os.environ, "HOME": "/home/pi"},
-            )
-            out = result.stdout + result.stderr
-            return out.strip() or "(no output)"
-        except subprocess.TimeoutExpired:
-            return f"[error] Command timed out after {timeout}s"
-        except Exception as e:
-            return f"[error] {e}"
-
-    if tool_suffix == "python":
-        code = arguments.get("code", "")
-        if not code or not code.strip():
-            return '[error] Missing required argument "code". Call system__python with: {"code": "your complete Python script here"}'
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
-                f.write(code)
-                tmp_path = f.name
-            result = subprocess.run(
-                ["python3", tmp_path], capture_output=True, text=True, timeout=timeout,
-                env={**os.environ, "HOME": "/home/pi"},
-            )
-            os.unlink(tmp_path)
-            out = result.stdout + result.stderr
-            return out.strip() or "(no output)"
-        except subprocess.TimeoutExpired:
-            return f"[error] Script timed out after {timeout}s"
-        except Exception as e:
-            return f"[error] {e}"
-
-    if tool_suffix == "write_file":
-        path = arguments.get("path", "")
-        content = arguments.get("content")
-        if not path:
-            return '[error] Missing required argument "path". Call system__write_file with: {"path": "/absolute/path/to/file", "content": "file content here"}'
-        if content is None:
-            return '[error] Missing required argument "content". Call system__write_file with: {"path": "' + path + '", "content": "file content here"}'
-        content = str(content)
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as f:
-                f.write(content)
-            _connector_upload_bg(path)
-            return f"Written {len(content)} bytes to {path}"
-        except Exception as e:
-            return f"[error] {e}"
-
-    if tool_suffix == "read_file":
-        path = arguments.get("path", "")
-        if not path:
-            return '[error] Missing required argument "path". Call system__read_file with: {"path": "/absolute/path/to/file"}'
-        try:
-            with open(path) as f:
-                content = f.read()
-            return content or "(empty file)"
-        except FileNotFoundError:
-            pulled = _connector_pull(path)
-            if pulled is not None:
-                return pulled
-            return f"[error] File not found: {path}"
-        except Exception as e:
-            return f"[error] {e}"
-
-    if tool_suffix == "web_search_kimi":
-        query = arguments.get("query", "")
-        if not query:
-            return "[error] No query provided"
-        max_results = min(int(arguments.get("max_results", 5)), 10)
-        try:
-            return _web_search_kimi(query, max_results)
-        except Exception as e:
-            return f"[error] web_search_kimi: {e}"
-
-    if tool_suffix == "web_search_claude":
-        query = arguments.get("query", "")
-        if not query:
-            return "[error] No query provided"
-        max_results = min(int(arguments.get("max_results", 5)), 10)
-        try:
-            return _web_search_claude(query, max_results)
-        except Exception as e:
-            return f"[error] web_search_claude: {e}"
-
-    if tool_suffix == "web_search":
-        query = arguments.get("query", "")
-        if not query:
-            return "[error] No query provided"
-        max_results = min(int(arguments.get("max_results", 5)), 10)
-        try:
-            return _web_search(query, max_results, user_model=user_model)
-        except Exception as e:
-            return f"[error] Web search failed: {e}"
-
-    if tool_suffix == "ssh":
-        import shutil
-        host = arguments.get("host", "")
-        user = arguments.get("user", "")
-        password = arguments.get("password", "")
-        command = arguments.get("command", "")
-        port = int(arguments.get("port", 22))
-        if not all([host, user, password, command]):
-            return "[error] Missing required SSH parameters: host, user, password, command"
-        if not shutil.which("sshpass"):
-            return "[error] sshpass not found — install with: apt-get install sshpass"
-        try:
-            result = subprocess.run(
-                ["sshpass", "-p", password, "ssh",
-                 "-o", "StrictHostKeyChecking=no",
-                 "-o", "ConnectTimeout=10",
-                 "-p", str(port),
-                 f"{user}@{host}", command],
-                capture_output=True, text=True, timeout=timeout,
-                env={**os.environ, "HOME": "/home/pi"},
-            )
-            out = result.stdout + result.stderr
-            return out.strip() or "(no output)"
-        except subprocess.TimeoutExpired:
-            return f"[error] SSH command timed out after {timeout}s"
-        except Exception as e:
-            return f"[error] {e}"
-
-    if tool_suffix == "spawn_agents":
-        import threading
-        tasks = arguments.get("tasks", [])
-        agent_timeout = int(arguments.get("timeout", 120))
-        if not tasks:
-            return "[error] No tasks provided"
-        agents = load_agents()
-        results = {}
-        errors = {}
-
-        def _run_agent_task(agent_id: str, task_text: str):
-            if agent_id not in agents:
-                available = ", ".join(agents.keys()) or "none configured"
-                errors[agent_id] = f"Agent '{agent_id}' not found. Valid agent IDs: {available}"
-                return
-            body = {"messages": [{"role": "user", "content": task_text}]}
-            text_parts = []
-            try:
-                for event in chat_with_agent_stream(body, agent_id):
-                    if event.get("type") == "text":
-                        text_parts.append(event.get("text", ""))
-                    elif event.get("type") == "error":
-                        errors[agent_id] = event.get("message", "unknown error")
-                        return
-                results[agent_id] = "".join(text_parts).strip() or "(no output)"
-            except Exception as e:
-                errors[agent_id] = str(e)
-
-        threads = []
-        for item in tasks:
-            agent_id = item.get("agent", "")
-            task_text = item.get("task", "")
-            if not agent_id or not task_text:
-                continue
-            t = threading.Thread(target=_run_agent_task, args=(agent_id, task_text), daemon=True)
-            threads.append((agent_id, t))
-            t.start()
-
-        for agent_id, t in threads:
-            t.join(timeout=agent_timeout)
-            if t.is_alive():
-                errors[agent_id] = f"Timed out after {agent_timeout}s"
-
-        parts = []
-        for item in tasks:
-            aid = item.get("agent", "")
-            task = item.get("task", "")
-            agent_name = agents.get(aid, {}).get("name", aid) if aid in agents else aid
-            if aid in errors:
-                parts.append(f"### {agent_name}\n**Error:** {errors[aid]}")
-            else:
-                parts.append(f"### {agent_name}\n{results.get(aid, '(no response)')}")
-
-        return "\n\n".join(parts)
-
-    if tool_suffix == "schedule_task":
-        from scheduler import create_task
-        name = arguments.get("name", "Unnamed task")
-        instruction = arguments.get("instruction", "")
-        schedule_type = arguments.get("schedule_type", "once")
-        if not instruction:
-            return "[error] No instruction provided"
-        kwargs = {k: v for k, v in arguments.items() if k not in ("name", "instruction", "schedule_type")}
-        try:
-            task = create_task(name, instruction, schedule_type, **kwargs)
-            return f"Task created: '{task['name']}' (id: {task['id']}) — next run: {task.get('next_run', 'N/A')}"
-        except Exception as e:
-            return f"[error] {e}"
-
-    if tool_suffix == "list_tasks":
-        from scheduler import list_tasks
-        try:
-            tasks = list_tasks()
-            if not tasks:
-                return "No scheduled tasks."
-            lines = []
-            for t in tasks:
-                status = t.get("status", "unknown")
-                next_run = t.get("next_run") or "N/A"
-                last_run = t.get("last_run") or "never"
-                lines.append(
-                    f"- [{t['id']}] {t['name']} | type: {t['schedule_type']} | "
-                    f"status: {status} | next: {next_run} | last: {last_run}"
-                )
-            return "\n".join(lines)
-        except Exception as e:
-            return f"[error] {e}"
-
-    if tool_suffix == "cancel_task":
-        from scheduler import delete_task, pause_task
-        task_id = arguments.get("task_id", "")
-        action = arguments.get("action", "delete")
-        if not task_id:
-            return "[error] No task_id provided"
-        try:
-            if action == "pause":
-                ok = pause_task(task_id)
-                return f"Task {task_id} paused." if ok else f"[error] Task {task_id} not found"
-            else:
-                ok = delete_task(task_id)
-                return f"Task {task_id} deleted." if ok else f"[error] Task {task_id} not found"
-        except Exception as e:
-            return f"[error] {e}"
-
-    if tool_suffix == "handoff":
-        agent_id = arguments.get("agent_id", "")
-        task = arguments.get("task", "")
-        context = arguments.get("context", "")
-        expected_output = arguments.get("expected_output", "")
-        if not agent_id or not task:
-            return "[error] handoff requires agent_id and task"
-        agents = load_agents()
-        if agent_id not in agents:
-            available = ", ".join(agents.keys())
-            return f"[error] Unknown agent: '{agent_id}'. Available: {available}"
-        # Build structured handoff brief
-        parts = ["[HANDOFF BRIEF]"]
-        if context:
-            parts.append(f"Context: {context}")
-        parts.append(f"Task: {task}")
-        if expected_output:
-            parts.append(f"Expected output: {expected_output}")
-        parts.append("---\nRespond directly and concisely. No need to introduce yourself.")
-        handoff_msg = "\n".join(parts)
-        body = {"messages": [{"role": "user", "content": handoff_msg}], "model": "default"}
-        result_parts = []
-        try:
-            for ev in chat_with_agent_stream(body, agent_id):
-                if ev.get("type") == "done":
-                    result_parts.append(ev.get("content", ""))
-                elif ev.get("type") == "text":
-                    result_parts.append(ev.get("text", ""))
-        except Exception as e:
-            return f"[error] Handoff to '{agent_id}' failed: {e}"
-        agent_name = agents[agent_id].get("name", agent_id)
-        result = "".join(result_parts).strip() or "(no response)"
-        return f"[Handoff → {agent_name}]\n{result}"
-
-    if tool_suffix == "get_system_info":
-        try:
-            import socket
-            lines = []
-            # Hostname
-            lines.append(f"hostname: {socket.gethostname()}")
-            # CPU usage
-            try:
-                with open("/proc/stat") as f:
-                    cpu = f.readline().split()
-                idle = int(cpu[4])
-                total = sum(int(x) for x in cpu[1:])
-                lines.append(f"cpu_usage: {round(100 * (1 - idle / total), 1)}%")
-            except Exception:
-                pass
-            # RAM
-            try:
-                with open("/proc/meminfo") as f:
-                    mem = {k.strip(): v.strip() for k, v in (l.split(":", 1) for l in f if ":" in l)}
-                total_kb = int(mem.get("MemTotal", "0 kB").split()[0])
-                avail_kb = int(mem.get("MemAvailable", "0 kB").split()[0])
-                used_kb = total_kb - avail_kb
-                lines.append(f"ram_total: {total_kb // 1024} MB")
-                lines.append(f"ram_used: {used_kb // 1024} MB ({round(100 * used_kb / total_kb, 1)}%)")
-            except Exception:
-                pass
-            # Temperature
-            try:
-                with open("/sys/class/thermal/thermal_zone0/temp") as f:
-                    lines.append(f"cpu_temp: {int(f.read().strip()) / 1000:.1f}°C")
-            except Exception:
-                pass
-            # Disk
-            try:
-                r = subprocess.run(["df", "-h", "/"], capture_output=True, text=True, timeout=5)
-                parts = r.stdout.strip().splitlines()
-                if len(parts) > 1:
-                    fields = parts[1].split()
-                    lines.append(f"disk_total: {fields[1]}, disk_used: {fields[2]} ({fields[4]})")
-            except Exception:
-                pass
-            # IPs
-            try:
-                r = subprocess.run(["ip", "-brief", "addr"], capture_output=True, text=True, timeout=5)
-                for line in r.stdout.strip().splitlines():
-                    parts = line.split()
-                    if len(parts) >= 3 and parts[0] != "lo" and parts[2]:
-                        lines.append(f"ip_{parts[0]}: {parts[2]}")
-            except Exception:
-                pass
-            return "\n".join(lines)
-        except Exception as e:
-            return f"[error] {e}"
-
-    if tool_suffix == "ssh_execute":
-        # Alias of system__ssh for new naming
-        return _execute_builtin("ssh", arguments)
-
-    if tool_suffix == "disk":
-        path = arguments.get("path", "/")
-        try:
-            result = subprocess.run(
-                ["df", "-h", path], capture_output=True, text=True, timeout=10,
-                env={**os.environ, "HOME": "/home/pi"},
-            )
-            return result.stdout.strip() or result.stderr.strip() or "(no output)"
-        except Exception as e:
-            return f"[error] {e}"
-
-    if tool_suffix == "search_engines_list":
-        engines = _load_search_engines()
-        lines = []
-        for name, cfg in sorted(engines.items(), key=lambda x: -x[1].get("reliability", 0.5)):
-            lines.append(f"- {name}: reliability={cfg.get('reliability',0.5):.2f} regions={cfg.get('regions',[])} lang={cfg.get('language','any')}")
-        return "Search engines pool:\n" + "\n".join(lines)
-
-    if tool_suffix == "search_engine_add":
-        name = arguments.get("name", "").strip().lower()
-        url = arguments.get("url", "")
-        regions = arguments.get("regions", ["OTHER"])
-        language = arguments.get("language", "any")
-        headers = arguments.get("headers", {})
-        patterns = arguments.get("patterns", {})
-        if not name or not url:
-            return "[error] name and url are required"
-        engines = _load_search_engines()
-        engines[name] = {
-            "url": url,
-            "headers": headers or {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36"
-            },
-            "regions": regions,
-            "language": language,
-            "timeout": 10,
-            "reliability": 0.5,
-            "patterns": patterns,
-        }
-        _save_search_engines(engines)
-        return f"Engine '{name}' added to pool. Use system__search_engine_test to validate."
-
-    if tool_suffix == "search_engine_test":
-        name = arguments.get("name", "")
-        query = arguments.get("query", "test search engine")
-        engines = _load_search_engines()
-        if name not in engines:
-            return f"[error] Engine '{name}' not found. Use system__search_engines_list."
-        cfg = engines[name]
-        try:
-            html_body = _fetch_search_html(cfg, query)
-            results = _parse_results(html_body, cfg.get("patterns", {}), 3)
-            if results:
-                cfg["reliability"] = min(1.0, cfg.get("reliability", 0.5) * 0.9 + 0.1)
-                engines[name] = cfg
-                _save_search_engines(engines)
-                return f"✓ Engine '{name}' working — {len(results)} results.\n\n" + "\n".join(results[:2])
-            # Try to adapt — use user_model if available
-            new_patterns = _adapt_engine_patterns(name, cfg, html_body, user_model=user_model)
-            if new_patterns:
-                cfg["patterns"] = new_patterns
-                results = _parse_results(html_body, new_patterns, 3)
-                if results:
-                    cfg["reliability"] = 0.6
-                    engines[name] = cfg
-                    _save_search_engines(engines)
-                    return f"✓ Engine '{name}' fixed by AI — {len(results)} results.\n\n" + "\n".join(results[:2])
-            cfg["reliability"] = max(0.1, cfg.get("reliability", 0.5) * 0.7)
-            engines[name] = cfg
-            _save_search_engines(engines)
-            return f"✗ Engine '{name}' returns 0 results. Patterns may need manual review."
-        except Exception as e:
-            cfg["reliability"] = max(0.1, cfg.get("reliability", 0.5) * 0.7)
-            engines[name] = cfg
-            _save_search_engines(engines)
-            return f"✗ Engine '{name}' failed: {e}"
-
+    handler = _BUILTIN_SUB_DISPATCH.get(tool_suffix)
+    if handler:
+        return handler(arguments, user_model=user_model)
     return f"[error] Unknown built-in tool: system__{tool_suffix}"
-
 
 _region_cache = {"code": None, "ts": 0}
 
@@ -2501,10 +2291,11 @@ def _web_search(query: str, max_results: int = 5, user_model: str = None) -> str
         brave_api_key = core_cfg.get("brave_api_key", "").strip()
         # Vault override for Brave API key
         try:
-            from vault import Vault
-            vbrave = Vault().get("brave_api_key")
-            if vbrave:
-                brave_api_key = vbrave
+            v = _get_vault()
+            if v:
+                vbrave = v.get("brave_api_key")
+                if vbrave:
+                    brave_api_key = vbrave
         except Exception:
             pass
         # search_mode: "auto" | "llm" | "pi"
@@ -2637,7 +2428,7 @@ def _web_search(query: str, max_results: int = 5, user_model: str = None) -> str
 
 EXEC_WORKDIR = "/tmp/clawbot-agent"
 EXEC_USER = "openjarvis-agents"
-_PROTECTED_PATHS = ("/etc/", "/usr/", "/boot/", "/bin/", "/sbin/", "/lib/", "/sys/")
+# Protected paths removed — to be reimplemented with user-facing UI
 
 
 def _execute_files_tool(tool_suffix: str, arguments: dict) -> str:
@@ -2669,8 +2460,6 @@ def _execute_files_tool(tool_suffix: str, arguments: dict) -> str:
         if content is None:
             return '[error] Missing "content"'
         content = str(content)
-        if not force and any(path.startswith(p) for p in _PROTECTED_PATHS):
-            return f'[blocked] Path {path!r} is in a protected system directory. Use force=true to override.'
         try:
             parent = os.path.dirname(os.path.abspath(path))
             os.makedirs(parent, exist_ok=True)
@@ -2736,8 +2525,6 @@ def _execute_files_tool(tool_suffix: str, arguments: dict) -> str:
         recursive = arguments.get("recursive", False)
         if not path:
             return '[error] Missing "path"'
-        if any(path.rstrip("/") == p.rstrip("/") for p in _PROTECTED_PATHS):
-            return f"[blocked] Refusing to delete protected path: {path}"
         try:
             if os.path.isdir(path):
                 if recursive:
@@ -2957,20 +2744,40 @@ def _execute_exec_tool(tool_suffix: str, arguments: dict) -> str:
 
 
 # ── Vault tools ──────────────────────────────────────────────────────────────
+VAULT_SETTINGS_PATH = "/home/pi/.openjarvis/vault-settings.json"
 _vault_instance = None
 
 
+def _is_vault_enabled():
+    """Check if vault is enabled. Default: True (enabled)."""
+    try:
+        with open(VAULT_SETTINGS_PATH) as f:
+            return json.loads(f.read()).get("vault_enabled", True)
+    except Exception:
+        return True  # Default: vault enabled
+
+
 def _get_vault():
-    """Lazy-init vault singleton."""
+    """Lazy-init vault singleton.  Pre-warm substitution cache on first call.
+    Returns None if vault is disabled via settings toggle."""
+    if not _is_vault_enabled():
+        return None  # Vault disabled — bypass everything
     global _vault_instance
     if _vault_instance is None:
         from vault import Vault
         _vault_instance = Vault()
+        # Pre-warm: decrypt all substitutions now so first mask() is free
+        try:
+            _vault_instance._load_substitutions()
+        except Exception:
+            pass
     return _vault_instance
 
 
 def _execute_vault_tool(tool_suffix: str, arguments: dict) -> str:
     """Execute a vault module tool."""
+    if not _is_vault_enabled():
+        return "[vault disabled] The credential vault is currently disabled by the user. Cannot execute vault operations."
     try:
         if tool_suffix == "store":
             v = _get_vault()
@@ -3005,6 +2812,14 @@ def _execute_vault_tool(tool_suffix: str, arguments: dict) -> str:
         if tool_suffix == "flag_secret":
             v = _get_vault()
             _val = arguments["value"]
+            # Route otpauth:// URIs to TOTP storage instead of generic secret
+            if _val.strip().startswith("otpauth://"):
+                try:
+                    stored_name, is_new = v.totp_add_from_uri(_val.strip())
+                    return (f"TOTP entry '{stored_name}' {'added' if is_new else 'updated'} "
+                            f"from URI. Code generation ready via vault__totp_generate.")
+                except Exception as _e:
+                    log.warning("flag_secret otpauth:// route failed: %s — falling back", _e)
             _name = arguments["suggested_name"]
             _cat = arguments.get("category", "other")
             _pattern = arguments.get("pattern_hint", "")
@@ -3046,6 +2861,67 @@ def _execute_vault_tool(tool_suffix: str, arguments: dict) -> str:
                 lines.append("  - " + " ".join(parts))
             return f"Found {len(matches)} match(es):\n" + "\n".join(lines)
 
+        if tool_suffix == "totp_add":
+            v = _get_vault()
+            name = arguments.get("name", "")
+            secret = arguments.get("secret", "")
+            issuer = arguments.get("issuer", "")
+            if not name or not secret:
+                return "Error: name and secret are required"
+            if secret.startswith("otpauth://"):
+                stored_name, is_new = v.totp_add_from_uri(secret, name_override=name)
+                return f"TOTP '{stored_name}' {'added' if is_new else 'updated'} from URI"
+            else:
+                is_new = v.totp_add(name, secret, issuer=issuer)
+                return f"TOTP '{name}' {'added' if is_new else 'updated'}"
+
+        if tool_suffix == "totp_code":
+            v = _get_vault()
+            name = arguments.get("name", "")
+            if not name:
+                return "Error: name is required"
+            result = v.totp_get_code(name)
+            if result is None:
+                return f"Error: TOTP entry '{name}' not found"
+            return f"{result['code']} (expires in {result['remaining']}s)"
+
+        if tool_suffix == "totp_list":
+            v = _get_vault()
+            entries = v.totp_list()
+            if not entries:
+                return "No TOTP entries stored"
+            lines = [f"- {e['name']}" + (f" ({e['issuer']})" if e['issuer'] else "") for e in entries]
+            return "TOTP entries:\n" + "\n".join(lines)
+
+        if tool_suffix == "totp_delete":
+            v = _get_vault()
+            name = arguments.get("name", "")
+            if not name:
+                return "Error: name is required"
+            deleted = v.totp_delete(name)
+            return f"TOTP '{name}' deleted" if deleted else f"TOTP entry '{name}' not found"
+
+        if tool_suffix == "totp_search":
+            v = _get_vault()
+            q = arguments.get("query", "").lower()
+            if not q:
+                return "Error: query is required"
+            entries = v.totp_list()
+            matches = [e for e in entries if q in e["name"].lower() or q in (e.get("issuer") or "").lower()]
+            if not matches:
+                return f"No TOTP entries matching '{arguments['query']}'."
+            lines = [f"- {e['name']}" + (f" ({e['issuer']})" if e.get('issuer') else "") for e in matches]
+            return f"Found {len(matches)} TOTP match(es):\n" + "\n".join(lines)
+
+        if tool_suffix == "totp_verify":
+            name = arguments.get("name", "")
+            code = arguments.get("code", "")
+            if not name or not code:
+                return "Error: name and code are required"
+            v = _get_vault()
+            valid = v.totp_verify(name, code)
+            return f"Code {'VALID ✓' if valid else 'INVALID ✗'} for '{name}'"
+
     except Exception as e:
         log.error("vault tool error: %s", e)
         return f"[error] Vault operation failed: {e}"
@@ -3083,10 +2959,11 @@ def _execute_email_tool(tool_suffix: str, arguments: dict) -> str:
 
         # Vault override for SMTP password
         try:
-            from vault import Vault
-            vpwd = Vault().get("smtp_password")
-            if vpwd:
-                password = vpwd
+            v = _get_vault()
+            if v:
+                vpwd = v.get("smtp_password")
+                if vpwd:
+                    password = vpwd
         except Exception:
             pass
 
@@ -3196,14 +3073,54 @@ def _execute_git_tool(tool_suffix: str, arguments: dict) -> str:
     return f"[error] Unknown git tool: git__{tool_suffix}"
 
 
+def _execute_memory_tool(tool_suffix: str, arguments: dict, agent_id: str = None) -> str:
+    """Execute memory__* tools (save/read/delete agent persistent memory)."""
+    if not agent_id:
+        return "[error] memory tools require an agent context"
+    if tool_suffix == "save":
+        return save_agent_memory(agent_id, arguments.get("key", ""), arguments.get("value", ""))
+    if tool_suffix == "read":
+        mem = load_agent_memory(agent_id)
+        return mem if mem else "(no memories saved yet)"
+    if tool_suffix == "delete":
+        return delete_agent_memory(agent_id, arguments.get("key", ""))
+    return f"[error] Unknown memory tool: memory__{tool_suffix}"
+
+
+# ── Handler map — resolves DISPATCH_TABLE handler names to callables ──────────
+_HANDLER_MAP = {
+    "_execute_builtin":        lambda: _execute_builtin,
+    "_execute_files_tool":     lambda: _execute_files_tool,
+    "_execute_documents_tool": lambda: _execute_documents_tool,
+    "_execute_web_tool":       lambda: _execute_web_tool,
+    "_execute_exec_tool":      lambda: _execute_exec_tool,
+    "_execute_email_tool":     lambda: _execute_email_tool,
+    "_execute_git_tool":       lambda: _execute_git_tool,
+    "_execute_vault_tool":     lambda: _execute_vault_tool,
+    "_execute_memory_tool":    lambda: _execute_memory_tool,
+}
+
+
 def _execute_tool(tool_name: str, arguments_raw: str, user_model: str = None, agent_id: str = None) -> str:
-    """
-    Execute a tool by calling the owning module's HTTP endpoint.
-    tool_name format: "{module_id}__{tool_name}" (double underscore)
-    Built-in tools (system__*) are executed locally without HTTP.
-    user_model: model name selected by user — propagated to web_search/adaptation.
-    agent_id: agent context for memory tools.
-    Returns: string result (tool output or error description)
+    """Execute a tool call and return a plain-text result string.
+
+    Routing order:
+      1. DISPATCH_TABLE lookup (built-in handlers in this file)
+      2. HTTP POST to external module at 127.0.0.1:{port}/v1/{module_id}/execute
+
+    Args:
+        tool_name:      "{module_id}__{tool_suffix}" (double underscore separator)
+        arguments_raw:  JSON string of tool arguments
+        user_model:     Model selected by user — forwarded to web_search handlers
+        agent_id:       Agent context — forwarded to memory handlers
+
+    Returns:
+        Plain-text result string. Errors are prefixed with "[error] ".
+
+    External module response format (expected JSON):
+        {"result": "..."}  or  {"output": "..."}  →  extracted as string
+        {"error": "..."}                          →  "[error] ..."
+        Plain text / other JSON                   →  returned as-is
     """
     if "__" not in tool_name:
         return f"[error] Invalid tool name format: '{tool_name}' (expected module_id__tool)"
@@ -3215,53 +3132,30 @@ def _execute_tool(tool_name: str, arguments_raw: str, user_model: str = None, ag
     except json.JSONDecodeError:
         arguments = {"raw": arguments_raw}
 
-    # Built-in tools — executed locally without HTTP
-    if module_id == "system":
-        return _execute_builtin(tool_suffix, arguments, user_model=user_model)
-    if module_id == "files":
-        return _execute_files_tool(tool_suffix, arguments)
-    if module_id == "documents":
-        return _execute_documents_tool(tool_suffix, arguments)
-    if module_id == "web":
-        return _execute_web_tool(tool_suffix, arguments, user_model=user_model)
-    if module_id == "exec":
-        return _execute_exec_tool(tool_suffix, arguments)
-    if module_id == "email":
-        return _execute_email_tool(tool_suffix, arguments)
-    if module_id == "git":
-        return _execute_git_tool(tool_suffix, arguments)
-    if module_id == "agents":
-        # agents__delegate → system__handoff
-        if tool_suffix == "delegate":
-            return _execute_builtin("handoff", arguments)
-        return f"[error] Unknown agents tool: agents__{tool_suffix}"
-    if module_id == "scheduler":
-        # scheduler__create/list/cancel → system__schedule_task/list_tasks/cancel_task
-        _alias = {"create": "schedule_task", "list": "list_tasks", "cancel": "cancel_task"}
-        mapped = _alias.get(tool_suffix)
-        if mapped:
-            return _execute_builtin(mapped, arguments)
-        return f"[error] Unknown scheduler tool: scheduler__{tool_suffix}"
-    if module_id == "network":
-        # network__* → web__* aliases
-        _alias = {"http_get": "http_get", "http_post": "http_post", "download": "file_download"}
-        mapped = _alias.get(tool_suffix)
-        if mapped:
-            return _execute_web_tool(mapped, arguments)
-        return f"[error] Unknown network tool: network__{tool_suffix}"
-    if module_id == "memory":
-        if not agent_id:
-            return "[error] memory tools require an agent context"
-        if tool_suffix == "save":
-            return save_agent_memory(agent_id, arguments.get("key", ""), arguments.get("value", ""))
-        elif tool_suffix == "read":
-            mem = load_agent_memory(agent_id)
-            return mem if mem else "(no memories saved yet)"
-        elif tool_suffix == "delete":
-            return delete_agent_memory(agent_id, arguments.get("key", ""))
-        return f"[error] Unknown memory tool: memory__{tool_suffix}"
-    if module_id == "vault":
-        return _execute_vault_tool(tool_suffix, arguments)
+    # ── Built-in dispatch via DISPATCH_TABLE ──────────────────────────────────
+    entry = DISPATCH_TABLE.get(module_id)
+    if entry:
+        handler_fn = _HANDLER_MAP.get(entry["handler"])
+        if not handler_fn:
+            return f"[error] No handler registered for '{entry['handler']}'"
+        handler = handler_fn()
+
+        # Apply aliases (e.g. agents__delegate → handoff, scheduler__create → schedule_task)
+        aliases = entry.get("aliases")
+        if aliases:
+            mapped = aliases.get(tool_suffix)
+            if not mapped:
+                return f"[error] Unknown {module_id} tool: {module_id}__{tool_suffix}"
+            tool_suffix = mapped
+
+        # Build kwargs based on entry flags
+        kwargs = {}
+        if entry.get("user_model"):
+            kwargs["user_model"] = user_model
+        if entry.get("agent_id"):
+            kwargs["agent_id"] = agent_id
+
+        return handler(tool_suffix, arguments, **kwargs)
 
     port = _get_module_port(module_id)
     if port is None:
@@ -3279,12 +3173,7 @@ def _execute_tool(tool_name: str, arguments_raw: str, user_model: str = None, ag
     try:
         with urllib.request.urlopen(req, timeout=TOOL_TIMEOUT) as resp:
             raw = resp.read().decode(errors="replace")
-            try:
-                data = json.loads(raw)
-                # Accept {"result": "..."} or {"output": "..."} or plain string
-                return str(data.get("result") or data.get("output") or raw)
-            except json.JSONDecodeError:
-                return raw
+            return _normalize_module_response(raw, tool_name)
     except urllib.error.HTTPError as e:
         msg = e.read().decode(errors="replace")
         log.error("Tool '%s' HTTP %d: %s", tool_name, e.code, msg)
@@ -3292,6 +3181,34 @@ def _execute_tool(tool_name: str, arguments_raw: str, user_model: str = None, ag
     except Exception as e:
         log.error("Tool '%s' call failed: %s", tool_name, e)
         return f"[error] Tool call failed: {e}"
+
+
+def _normalize_module_response(raw: str, tool_name: str) -> str:
+    """Normalize an external module's HTTP response into a plain string.
+
+    Accepted JSON formats (in priority order):
+      {"error": "..."}         → "[error] ..."
+      {"result": "..."}        → str(result)
+      {"output": "..."}        → str(output)
+      any other JSON / string  → returned as-is
+
+    Non-JSON responses are returned verbatim.
+    Empty responses are flagged as errors.
+    """
+    if not raw or not raw.strip():
+        log.warning("Tool '%s' returned empty response", tool_name)
+        return f"[error] Tool '{tool_name}' returned empty response"
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            if "error" in data:
+                return f"[error] {data['error']}"
+            result = data.get("result") or data.get("output")
+            if result is not None:
+                return str(result)
+        return raw
+    except (json.JSONDecodeError, ValueError):
+        return raw
 
 
 def _get_module_port(module_id: str) -> int | None:

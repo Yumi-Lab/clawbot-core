@@ -46,7 +46,13 @@ Endpoints:
   POST /core/vault/backup-usb       — backup vault to USB  body: {password, usb_path}
   POST /core/vault/restore-usb      — restore vault from USB  body: {password, backup_file}
 
+  POST /core/vault/totp              — store TOTP secret  body: {name, secret, issuer?}
+  GET  /core/vault/totp              — list TOTP entries (no secrets)
+  GET  /core/vault/totp/{name}/code  — generate current TOTP code  {code, remaining, period}
+  DELETE /core/vault/totp/{name}     — delete TOTP entry (requires X-Vault-Confirm: true)
+
   POST /v1/chat/completions        — tool-aware chat proxy (→ ClawBot Core + module tools)
+  POST /v1/chat/inject             — inject follow-up message into active streaming session
 """
 
 import base64
@@ -92,6 +98,25 @@ def _save_assistant_to_session(session_id, content):
             log.info("Background save: response appended to session %s", session_id)
     except Exception as e:
         log.warning("Background session save failed: %s", e)
+
+
+def _append_to_session_file(session_id, message):
+    """Append a message dict to an existing session file (for inject persistence)."""
+    if not session_id or not message:
+        return
+    try:
+        fpath = os.path.join(SESSIONS_DIR, session_id + ".json")
+        if not os.path.isfile(fpath):
+            return
+        with open(fpath) as f:
+            session = json.load(f)
+        session.setdefault("messages", []).append(message)
+        session["updatedAt"] = int(time.time() * 1000)
+        with open(fpath, "w") as f:
+            json.dump(session, f)
+    except Exception as e:
+        log.warning("Failed to append to session file %s: %s", session_id, e)
+
 
 AGENT_SESSION_FILE = "/home/pi/workshop/sessions/agent_main_main.json"
 AGENT_WORKSPACE    = "/home/pi/workshop"
@@ -532,6 +557,12 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/core/sessions":
             try:
                 os.makedirs(SESSIONS_DIR, exist_ok=True)
+                # Get active WhatsApp processing state
+                wa_active = set()
+                wa_channel = _channel_router.get_channel("whatsapp") if _channel_router else None
+                if wa_channel and hasattr(wa_channel, "_active"):
+                    wa_active = {wa_channel._session_id_for(p)
+                                 for p, v in wa_channel._active.items() if v}
                 sessions = []
                 for fname in sorted(os.listdir(SESSIONS_DIR)):
                     if not fname.endswith(".json"):
@@ -539,7 +570,12 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         with open(os.path.join(SESSIONS_DIR, fname)) as f:
                             s = json.load(f)
-                        sessions.append({k: s[k] for k in ("id","name","mode","createdAt","updatedAt") if k in s})
+                        entry = {k: s[k] for k in ("id","name","mode","createdAt","updatedAt") if k in s}
+                        # Add processing flag for wa_* sessions
+                        sid = s.get("id", fname.replace(".json", ""))
+                        if sid.startswith("wa_"):
+                            entry["processing"] = sid in wa_active
+                        sessions.append(entry)
                     except Exception:
                         pass
                 sessions.sort(key=lambda s: s.get("updatedAt", 0), reverse=True)
@@ -691,9 +727,14 @@ class Handler(BaseHTTPRequestHandler):
             cfg = configparser.ConfigParser()
             cfg.read("/etc/clawbot/clawbot.cfg")
             self.send_json(200, {
+                "mode": cfg.get("whatsapp", "mode", fallback="personal"),
+                "admins": cfg.get("whatsapp", "admins", fallback=""),
                 "allow_from": cfg.get("whatsapp", "allow_from", fallback="*"),
+                "blacklist": cfg.get("whatsapp", "blacklist", fallback=""),
                 "default_model": cfg.get("whatsapp", "default_model", fallback="default"),
                 "default_mode": cfg.get("whatsapp", "default_mode", fallback="core"),
+                "vault_2fa": cfg.get("whatsapp", "vault_2fa", fallback="off"),
+                "user_tools": cfg.get("whatsapp", "user_tools", fallback="web_search"),
             })
 
         # ── WeCom bridge status proxy ─────────────────────────────────────────
@@ -868,6 +909,53 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
 
+        # ── Vault TOTP: batch codes, individual code, list ───────────────────
+        elif path == "/core/vault/totp/codes":
+            try:
+                v = get_vault()
+                entries = v.totp_list()
+                codes = []
+                for e in entries:
+                    result = v.totp_get_code(e["name"])
+                    if result and "code" in result:
+                        codes.append({"name": e["name"], "issuer": e.get("issuer", ""), **result})
+                self.send_json(200, {"codes": codes})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path.startswith("/core/vault/totp/") and path.endswith("/code"):
+            name = unquote(path[len("/core/vault/totp/"):-len("/code")])
+            if not name:
+                self.send_json(400, {"error": "invalid name"})
+                return
+            try:
+                v = get_vault()
+                result = v.totp_get_code(name)
+                if result is None:
+                    self.send_json(404, {"error": f"TOTP '{name}' not found"})
+                else:
+                    self.send_json(200, result)
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path == "/core/vault/totp":
+            try:
+                v = get_vault()
+                entries = v.totp_list()
+                self.send_json(200, {"entries": entries})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path == "/core/vault/settings":
+            try:
+                with open("/home/pi/.openjarvis/vault-settings.json") as f:
+                    data = json.loads(f.read())
+                self.send_json(200, data)
+            except FileNotFoundError:
+                self.send_json(200, {"vault_enabled": True})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
         elif path.startswith("/core/vault/"):
             name = unquote(path[len("/core/vault/"):])
             if not name or ".." in name:
@@ -1034,6 +1122,23 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "session_id required"})
             return
 
+        # Inject follow-up message into an active streaming session
+        if path == "/v1/chat/inject":
+            session_id = data.get("session_id", "")
+            content = data.get("content", "").strip()
+            if not session_id or not content:
+                self.send_json(400, {"error": "session_id and content required"})
+                return
+            from orchestrator import inject_message
+            accepted = inject_message(session_id, content)
+            if accepted:
+                _append_to_session_file(session_id, {"role": "user", "content": content})
+                log.info("Inject accepted: session=%s content=%s", session_id, content[:60])
+                self.send_json(200, {"ok": True, "status": "injected"})
+            else:
+                self.send_json(200, {"ok": False, "status": "no_active_session"})
+            return
+
         # Tool sandbox approval decision
         if path == "/v1/tool-approval":
             from orchestrator import resolve_approval
@@ -1069,7 +1174,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"ok": True})
             return
 
-        # WhatsApp config update (allow_from, default_model, default_mode)
+        # WhatsApp config update
         if path == "/v1/whatsapp/config":
             try:
                 cfg_path = "/etc/clawbot/clawbot.cfg"
@@ -1077,12 +1182,11 @@ class Handler(BaseHTTPRequestHandler):
                 cfg.read(cfg_path)
                 if not cfg.has_section("whatsapp"):
                     cfg.add_section("whatsapp")
-                if "allow_from" in data:
-                    cfg.set("whatsapp", "allow_from", data["allow_from"].strip())
-                if "default_model" in data:
-                    cfg.set("whatsapp", "default_model", data["default_model"].strip())
-                if "default_mode" in data:
-                    cfg.set("whatsapp", "default_mode", data["default_mode"].strip())
+                wa_fields = ("mode", "admins", "allow_from", "blacklist",
+                             "default_model", "default_mode", "vault_2fa", "user_tools")
+                for field in wa_fields:
+                    if field in data:
+                        cfg.set("whatsapp", field, str(data[field]).strip())
                 with open(cfg_path, "w") as f:
                     cfg.write(f)
                 self.send_json(200, {"ok": True, "message": "whatsapp config updated"})
@@ -1624,6 +1728,59 @@ class Handler(BaseHTTPRequestHandler):
                 log.error("GDrive auth failed: %s", e)
                 self.send_json(500, {"error": str(e)})
 
+        # ── Vault TOTP: POST /core/vault/totp/{name}/rename ────────────────
+        elif path.startswith("/core/vault/totp/") and path.endswith("/rename"):
+            old_name = unquote(path[len("/core/vault/totp/"):-len("/rename")])
+            new_name = data.get("new_name", "").strip()
+            if not old_name or not new_name:
+                self.send_json(400, {"error": "old_name and new_name required"})
+                return
+            try:
+                v = get_vault()
+                renamed = v.totp_rename(old_name, new_name)
+                if renamed:
+                    self.send_json(200, {"ok": True, "old": old_name, "new": new_name})
+                else:
+                    self.send_json(404, {"error": f"TOTP '{old_name}' not found"})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        # ── Vault settings toggle: POST /core/vault/settings ─────────────────
+        elif path == "/core/vault/settings":
+            vault_enabled = data.get("vault_enabled")
+            if vault_enabled is None or not isinstance(vault_enabled, bool):
+                self.send_json(400, {"error": "vault_enabled (bool) required"})
+                return
+            try:
+                import os
+                os.makedirs("/home/pi/.openjarvis", exist_ok=True)
+                with open("/home/pi/.openjarvis/vault-settings.json", "w") as f:
+                    f.write(json.dumps({"vault_enabled": vault_enabled}))
+                self.send_json(200, {"ok": True, "vault_enabled": vault_enabled})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        # ── Vault TOTP: POST /core/vault/totp ────────────────────────────────
+        elif path == "/core/vault/totp":
+            name = data.get("name", "").strip()
+            secret = data.get("secret", "").strip()
+            issuer = data.get("issuer", "")
+            if not name or not secret:
+                self.send_json(400, {"error": "name and secret required"})
+                return
+            try:
+                v = get_vault()
+                if secret.startswith("otpauth://"):
+                    stored_name, is_new = v.totp_add_from_uri(secret, name_override=name)
+                    self.send_json(200, {"ok": True, "name": stored_name, "created": is_new})
+                else:
+                    is_new = v.totp_add(name, secret, issuer=issuer)
+                    self.send_json(200, {"ok": True, "name": name, "created": is_new})
+            except ValueError as e:
+                self.send_json(400, {"error": str(e)})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
         # ── Vault: POST /core/vault, POST /core/vault/protected ───────────────
         elif path == "/core/vault":
             name = data.get("name", "").strip()
@@ -1911,6 +2068,25 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {"ok": True, "message": "Google Drive disconnected"})
             except Exception as e:
                 log.error("GDrive disconnect failed: %s", e)
+                self.send_json(500, {"error": str(e)})
+
+        # ── Vault TOTP: DELETE /core/vault/totp/{name} ─────────────────────
+        elif path.startswith("/core/vault/totp/"):
+            if self.headers.get("X-Vault-Confirm") != "true":
+                self.send_json(403, {"error": "missing X-Vault-Confirm: true header"})
+                return
+            name = unquote(path[len("/core/vault/totp/"):])
+            if not name:
+                self.send_json(400, {"error": "invalid name"})
+                return
+            try:
+                v = get_vault()
+                deleted = v.totp_delete(name)
+                if deleted:
+                    self.send_json(200, {"ok": True, "deleted": name})
+                else:
+                    self.send_json(404, {"error": f"TOTP '{name}' not found"})
+            except Exception as e:
                 self.send_json(500, {"error": str(e)})
 
         # ── Vault: DELETE /core/vault/{name}, /core/vault/protected/{name} ────

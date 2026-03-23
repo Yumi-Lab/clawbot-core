@@ -34,6 +34,21 @@ MAX_HISTORY = 10  # keep last N exchanges per phone number
 PROGRESS_DEBOUNCE = 5  # min seconds between progress messages
 UPSTREAM_INTERVAL = 30  # seconds — flush accumulated content to WhatsApp periodically
 
+# Tools restricted to admins only — never available to regular users
+ADMIN_ONLY_TOOLS = {"system__bash", "system__python", "system__ssh", "system__write_file",
+                    "system__read_file", "vault__get", "vault__set", "vault__list",
+                    "vault__delete", "vault__totp"}
+
+# System prompt injected for non-admin users
+NON_ADMIN_SYSTEM_PROMPT = (
+    "IMPORTANT: The current user is NOT an admin. "
+    "You must NEVER share sensitive data, credentials, passwords, API keys, "
+    "server addresses, SSH details, or any information from the vault. "
+    "You must NEVER execute system commands, read/write files, or access SSH. "
+    "If the user asks for restricted actions, politely explain that these "
+    "features require admin access."
+)
+
 # Tool name → user-friendly progress message
 _TOOL_PROGRESS = {
     "system__web_search": "Searching the web...",
@@ -55,6 +70,7 @@ class WhatsAppChannel(ChannelBase):
         self._lock = threading.Lock()
         self._active: dict = {}      # phone → True if a thread is currently processing
         self._queued: dict = {}      # phone → list of queued messages to process next
+        self._vault_2fa_ok: dict = {}  # phone → timestamp when 2FA was validated
 
     def start(self):
         pass  # Bridge is a separate Node.js process
@@ -76,8 +92,8 @@ class WhatsAppChannel(ChannelBase):
             streaming=False,
             images=True,
             audio=True,
-            files=False,
-            groups=False,
+            files=True,
+            groups=True,
             max_message_length=4000,
         )
 
@@ -126,6 +142,48 @@ class WhatsAppChannel(ChannelBase):
             log.error("WhatsApp send_message error: %s", e)
             return {"ok": False, "error": str(e)}
 
+    def send_image(self, to: str, image_path: str, caption: str = "") -> dict:
+        """Send an image via the bridge."""
+        is_jid = "@" in to
+        body = {"image_path": image_path}
+        if caption:
+            body["caption"] = caption
+        body["jid" if is_jid else "to"] = to
+        return self._bridge_post("/send-image", body)
+
+    def send_video(self, to: str, video_path: str, caption: str = "") -> dict:
+        """Send a video via the bridge."""
+        is_jid = "@" in to
+        body = {"video_path": video_path}
+        if caption:
+            body["caption"] = caption
+        body["jid" if is_jid else "to"] = to
+        return self._bridge_post("/send-video", body)
+
+    def send_file(self, to: str, file_path: str, filename: str = "") -> dict:
+        """Send a document/file via the bridge."""
+        is_jid = "@" in to
+        body = {"file_path": file_path}
+        if filename:
+            body["filename"] = filename
+        body["jid" if is_jid else "to"] = to
+        return self._bridge_post("/send-file", body)
+
+    def _bridge_post(self, endpoint: str, body: dict) -> dict:
+        """Generic POST to bridge. Returns parsed JSON response."""
+        payload = json.dumps(body).encode()
+        req = urllib.request.Request(
+            f"{BRIDGE_URL}{endpoint}", data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read())
+        except Exception as e:
+            log.error("WhatsApp bridge %s error: %s", endpoint, e)
+            return {"ok": False, "error": str(e)}
+
     def normalize_sender(self, raw_from: str) -> str:
         """Ensure phone number has leading +."""
         raw = raw_from.strip()
@@ -156,27 +214,42 @@ class WhatsAppChannel(ChannelBase):
         text = payload.get("text", "")
         media_path = payload.get("media_path")
 
-        if text:
-            user_content = text
-        elif media_path:
-            user_content = f"[{msg_type}: {media_path}]"
-        else:
+        user_content = self._format_inbound(msg_type, text, media_path)
+        if not user_content:
             return None
 
-        # Handle slash commands before LLM call
         reply_to = reply_jid if reply_jid else sender
+        wa_cfg = self._get_wa_config()
+
+        # Vault 2FA intercept (before anything else for admins)
+        if self._check_vault_2fa(sender, user_content, reply_to, wa_cfg):
+            return {"session_id": sender, "sender": sender, "text": user_content,
+                    "type": "vault_2fa", "media_path": None}
+
+        # Handle slash commands — admin only in autonomous mode
         if user_content.startswith("/"):
+            if not self._is_admin(sender, wa_cfg):
+                self.send_message(reply_to, "Slash commands are restricted to admins.")
+                return {"session_id": sender, "sender": sender, "text": user_content,
+                        "type": "command_denied", "media_path": None}
             if self._handle_command(sender, user_content.strip(), reply_to):
                 return {"session_id": sender, "sender": sender, "text": user_content,
                         "type": "command", "media_path": None}
 
-        # If a thread is already processing for this sender, queue the message
+        # If a thread is already processing for this sender, try mid-stream inject
         with self._lock:
             if self._active.get(sender):
-                self._queued.setdefault(sender, []).append(user_content)
-                log.info("WhatsApp: queued message for %s (%d in queue)",
-                         sender, len(self._queued[sender]))
-                self.send_message(reply_to, "Message received, I'll handle it right after the current task.")
+                # Try to inject into active tool loop (real-time, like Claude Code)
+                from orchestrator import inject_message
+                if inject_message(sender, user_content):
+                    log.info("WhatsApp: mid-stream inject for %s: %s", sender, user_content[:60])
+                    self.send_message(reply_to, "Got it, I'm adjusting my response...")
+                else:
+                    # No active tool loop — fall back to queue
+                    self._queued.setdefault(sender, []).append(user_content)
+                    log.info("WhatsApp: queued message for %s (%d in queue)",
+                             sender, len(self._queued[sender]))
+                    self.send_message(reply_to, "Message received, I'll handle it right after the current task.")
                 return {"session_id": sender, "sender": sender, "text": user_content,
                         "type": msg_type, "media_path": media_path}
             self._active[sender] = True
@@ -397,6 +470,37 @@ class WhatsAppChannel(ChannelBase):
 
     # ── Internal ────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _format_inbound(msg_type: str, text: str, media_path: str = None) -> str:
+        """Format inbound message for the LLM based on type."""
+        if msg_type == "text" or msg_type == "conversation":
+            return text or ""
+        if msg_type == "image":
+            if text:
+                return f"[Image: {media_path}] {text}" if media_path else text
+            return f"[Image: {media_path}]" if media_path else ""
+        if msg_type == "audio":
+            return f"[Voice message: {media_path}]" if media_path else ""
+        if msg_type == "video":
+            if text:
+                return f"[Video: {media_path}] {text}" if media_path else text
+            return f"[Video: {media_path}]" if media_path else ""
+        if msg_type == "file":
+            fname = text or "document"
+            return f"[File: {media_path} ({fname})]" if media_path else f"[File: {fname}]"
+        if msg_type == "sticker":
+            return f"[Sticker: {media_path}]" if media_path else "[Sticker]"
+        if msg_type == "location":
+            return text or "[Location shared]"
+        if msg_type == "contact":
+            return f"[Contact: {text}]" if text else "[Contact shared]"
+        # Fallback — unknown type
+        if text:
+            return text
+        if media_path:
+            return f"[{msg_type}: {media_path}]"
+        return ""
+
     def _reply_async(self, sender: str, user_content: str, reply_jid: str = "") -> None:
         """Call orchestrator via in-process streaming, send reply. Background thread.
         Drains queued messages after each response (like Claude Code follow-ups)."""
@@ -412,14 +516,16 @@ class WhatsAppChannel(ChannelBase):
 
                 prefs = self._get_user_prefs(sender)
 
-                full_reply, sent_len = self._call_orchestrator_stream(
+                full_reply, sent_len, injected = self._call_orchestrator_stream(
                     current_message, history, reply_to,
-                    model=prefs["model"], mode=prefs["mode"])
+                    model=prefs["model"], mode=prefs["mode"], sender=sender)
                 if not full_reply:
                     break
 
-                # Persist history (memory + disk)
+                # Persist history — include mid-stream injected messages
                 history.append({"role": "user", "content": current_message})
+                for inj in injected:
+                    history.append({"role": "user", "content": inj})
                 history.append({"role": "assistant", "content": full_reply})
                 self._save_history(sender, history)
 
@@ -445,25 +551,50 @@ class WhatsAppChannel(ChannelBase):
 
     def _call_orchestrator_stream(self, message: str, history: list,
                                    reply_to: str, model: str = "default",
-                                   mode: str = "core") -> tuple:
+                                   mode: str = "core", sender: str = "") -> tuple:
         """Call orchestrator in-process via streaming generator.
         Sends progress messages and upstream content flushes to WhatsApp.
-        Returns (full_content, sent_length) — sent_length is how much was
-        already sent upstream so _reply_async only sends the remainder."""
+        Returns (full_content, sent_length, injected_messages) — sent_length is how much was
+        already sent upstream so _reply_async only sends the remainder.
+        injected_messages is a list of user messages that were mid-stream injected."""
         from orchestrator import chat_with_tools_stream
+
+        wa_cfg = self._get_wa_config()
+        is_admin = self._is_admin(sender, wa_cfg)
+
+        # Build messages — inject restricted system prompt for non-admins
+        messages = list(history)
+        if not is_admin:
+            messages.insert(0, {"role": "system", "content": NON_ADMIN_SYSTEM_PROMPT})
+        messages.append({"role": "user", "content": message})
 
         body = {
             "model": model,
-            "messages": history + [{"role": "user", "content": message}],
+            "messages": messages,
             "stream": True,
             "channel": "whatsapp",
         }
 
+        # Tool restriction for non-admins
+        if not is_admin:
+            allowed = self._get_allowed_tools(sender, wa_cfg)
+            if allowed is not None:
+                body["_allowed_tools"] = list(allowed)
+
+        # Vault 2FA: block vault tools if not authenticated
+        if is_admin and wa_cfg["vault_2fa"] == "on":
+            auth_ts = self._vault_2fa_ok.get(sender, 0)
+            if time.time() - auth_ts >= 3600:
+                # Remove vault tools from available set
+                body.setdefault("_blocked_tools", []).extend(
+                    ["vault__get", "vault__set", "vault__list", "vault__delete", "vault__totp"])
+
         # Select generator based on mode
-        gen = self._get_stream_generator(body, message, mode)
+        gen = self._get_stream_generator(body, message, mode, session_id=sender)
 
         final_content = ""
         partial_content = ""
+        injected_msgs = []  # track mid-stream injected messages for history
         sent_len = 0  # how many chars already flushed upstream
         last_progress = 0
         last_upstream = time.time()
@@ -494,20 +625,29 @@ class WhatsAppChannel(ChannelBase):
                             reply_to, partial_content, sent_len)
                         last_upstream = now
 
+                elif etype == "user_injected":
+                    # Mid-stream inject confirmed — flush partial, reset for new response
+                    sent_len = self._upstream_flush(
+                        reply_to, partial_content, sent_len)
+                    partial_content = ""
+                    injected_msgs.append(event.get("content", ""))
+                    log.info("WhatsApp: user_injected event for %s: %s",
+                             reply_to, event.get("content", "")[:60])
+
                 elif etype == "done":
                     final_content = event.get("content", "")
 
                 elif etype == "error":
                     log.error("WhatsApp orchestrator error event: %s", event.get("message"))
-                    return (event.get("message", "An error occurred."), 0)
+                    return (event.get("message", "An error occurred."), 0, [])
 
         except Exception as e:
             log.error("WhatsApp orchestrator stream error: %s", e)
             if partial_content:
-                return (partial_content + "\n\n[Error — partial response]", sent_len)
-            return (f"Error: {e}", 0)
+                return (partial_content + "\n\n[Error — partial response]", sent_len, injected_msgs)
+            return (f"Error: {e}", 0, [])
 
-        return (final_content or partial_content, sent_len)
+        return (final_content or partial_content, sent_len, injected_msgs)
 
     def _upstream_flush(self, reply_to: str, content: str, sent_len: int) -> int:
         """Send any unsent content upstream to WhatsApp. Returns new sent_len."""
@@ -518,7 +658,7 @@ class WhatsAppChannel(ChannelBase):
             return len(content)
         return sent_len
 
-    def _get_stream_generator(self, body: dict, message: str, mode: str):
+    def _get_stream_generator(self, body: dict, message: str, mode: str, session_id: str = None):
         """Return the appropriate streaming generator based on mode."""
         from orchestrator import chat_with_tools_stream
 
@@ -534,7 +674,7 @@ class WhatsAppChannel(ChannelBase):
             except Exception as e:
                 log.warning("WhatsApp: agent routing failed (%s), falling back to core", e)
 
-        return chat_with_tools_stream(body)
+        return chat_with_tools_stream(body, session_id=session_id)
 
     @staticmethod
     def _tool_progress_text(tool_names: list) -> str:
@@ -549,15 +689,99 @@ class WhatsAppChannel(ChannelBase):
             labels.append(label)
         return " | ".join(labels) if labels else "Working..."
 
+    def _get_wa_config(self) -> dict:
+        """Read [whatsapp] section from config. Cached per call (re-reads each time)."""
+        cfg = configparser.ConfigParser()
+        cfg.read(CONFIG_PATH)
+        return {
+            "mode": cfg.get("whatsapp", "mode", fallback="personal"),
+            "admins": cfg.get("whatsapp", "admins", fallback=""),
+            "allow_from": cfg.get("whatsapp", "allow_from", fallback="*"),
+            "blacklist": cfg.get("whatsapp", "blacklist", fallback=""),
+            "vault_2fa": cfg.get("whatsapp", "vault_2fa", fallback="off"),
+            "user_tools": cfg.get("whatsapp", "user_tools", fallback="web_search"),
+            "default_model": cfg.get("whatsapp", "default_model", fallback="default"),
+            "default_mode": cfg.get("whatsapp", "default_mode", fallback="core"),
+        }
+
     def _is_allowed(self, phone: str) -> bool:
-        """Check [whatsapp] allow_from in /etc/clawbot/clawbot.cfg."""
+        """Check [whatsapp] allow_from + blacklist in config."""
         try:
-            cfg = configparser.ConfigParser()
-            cfg.read(CONFIG_PATH)
-            raw = cfg.get("whatsapp", "allow_from", fallback="*").strip()
+            wa_cfg = self._get_wa_config()
+            if self._is_blacklisted(phone, wa_cfg):
+                return False
+            raw = wa_cfg["allow_from"].strip()
             if raw == "*" or not raw:
                 return True
             allowed = {n.strip() for n in raw.split(",") if n.strip()}
             return phone in allowed
         except Exception:
             return True  # Fail open if config unreadable
+
+    def _is_admin(self, phone: str, wa_cfg: dict = None) -> bool:
+        """Check if phone is an admin.
+        In personal mode, everyone allowed is admin.
+        In autonomous mode, must be in admins list."""
+        if wa_cfg is None:
+            wa_cfg = self._get_wa_config()
+        mode = wa_cfg["mode"]
+        if mode == "personal":
+            return True  # personal mode = owner's phone, auto-admin
+        raw = wa_cfg["admins"].strip()
+        if not raw:
+            return False
+        admins = {n.strip() for n in raw.split(",") if n.strip()}
+        return phone in admins
+
+    def _is_blacklisted(self, phone: str, wa_cfg: dict = None) -> bool:
+        """Check if phone is blacklisted. Blacklisted = silently ignored."""
+        if wa_cfg is None:
+            wa_cfg = self._get_wa_config()
+        raw = wa_cfg["blacklist"].strip()
+        if not raw:
+            return False
+        blocked = {n.strip() for n in raw.split(",") if n.strip()}
+        return phone in blocked
+
+    def _get_allowed_tools(self, phone: str, wa_cfg: dict = None) -> set:
+        """Return set of tool name prefixes allowed for this user.
+        Admins get all tools. Non-admins get only user_tools from config."""
+        if wa_cfg is None:
+            wa_cfg = self._get_wa_config()
+        if self._is_admin(phone, wa_cfg):
+            return None  # None = no restriction
+        raw = wa_cfg["user_tools"].strip()
+        if not raw:
+            return set()  # no tools allowed
+        return {f"system__{t.strip()}" for t in raw.split(",") if t.strip()}
+
+    def _check_vault_2fa(self, phone: str, text: str, reply_to: str, wa_cfg: dict = None) -> bool:
+        """Handle vault 2FA challenge. Returns True if the message was consumed by 2FA flow.
+        If vault_2fa is on and user hasn't authenticated, intercept vault-related requests."""
+        if wa_cfg is None:
+            wa_cfg = self._get_wa_config()
+        if wa_cfg["vault_2fa"] != "on":
+            return False  # 2FA disabled
+        if not self._is_admin(phone, wa_cfg):
+            return False  # non-admins can't access vault anyway
+        # Check if already authenticated (valid for 1 hour)
+        auth_ts = self._vault_2fa_ok.get(phone, 0)
+        if time.time() - auth_ts < 3600:
+            return False  # still valid
+        # Check if user is sending the 2FA password
+        if text.startswith("/vault-auth "):
+            password = text[len("/vault-auth "):].strip()
+            # Read expected password from vault config
+            expected = wa_cfg.get("vault_2fa_password", "")
+            if not expected:
+                # Try reading from config file directly
+                cfg = configparser.ConfigParser()
+                cfg.read(CONFIG_PATH)
+                expected = cfg.get("whatsapp", "vault_2fa_password", fallback="")
+            if expected and password == expected:
+                self._vault_2fa_ok[phone] = time.time()
+                self.send_message(reply_to, "Vault access granted for 1 hour.")
+            else:
+                self.send_message(reply_to, "Invalid vault password.")
+            return True  # message consumed
+        return False  # not a 2FA interaction, continue normally

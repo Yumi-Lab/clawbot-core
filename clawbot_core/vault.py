@@ -8,11 +8,13 @@ from __future__ import annotations
 import base64
 import glob
 import hashlib
+import hmac
 import json
 import logging
 import os
 import re
 import sqlite3
+import struct
 import subprocess
 import time
 from dataclasses import dataclass
@@ -130,6 +132,7 @@ class Vault:
         try:
             secrets = conn.execute("SELECT name, value, category FROM secrets").fetchall()
             protected = conn.execute("SELECT name, value, alias, kind, category FROM protected").fetchall()
+            totp_rows = conn.execute("SELECT name, secret FROM totp_secrets").fetchall()
         finally:
             conn.close()
 
@@ -148,6 +151,14 @@ class Vault:
                 plaintext_protected.append((name, plain, alias, kind, cat))
             except VaultError:
                 log.warning("Could not decrypt protected %s during re-key, skipping", name)
+
+        plaintext_totp = []
+        for name, enc_secret in totp_rows:
+            try:
+                plain = self._decrypt(enc_secret)
+                plaintext_totp.append((name, plain))
+            except VaultError:
+                log.warning("Could not decrypt TOTP %s during re-key, skipping", name)
 
         # 2. Store password hash (PBKDF2, separate salt)
         salt = os.urandom(32)
@@ -190,10 +201,16 @@ class Vault:
                     "UPDATE protected SET value = ?, updated_at = ? WHERE name = ?",
                     (encrypted, now, name),
                 )
+            for name, plain in plaintext_totp:
+                encrypted = self._encrypt(plain)
+                conn.execute(
+                    "UPDATE totp_secrets SET secret = ? WHERE name = ?",
+                    (encrypted, name),
+                )
             conn.commit()
             self._invalidate_subs_cache()
-            log.info("Master password set, %d secrets + %d protected re-encrypted",
-                     len(plaintext_secrets), len(plaintext_protected))
+            log.info("Master password set, %d secrets + %d protected + %d TOTP re-encrypted",
+                     len(plaintext_secrets), len(plaintext_protected), len(plaintext_totp))
             return True
         except Exception:
             # Rollback to old key on failure
@@ -341,6 +358,16 @@ class Vault:
             for row in conn.execute("SELECT name, pattern, category, source, hits, created_at FROM learned_patterns").fetchall():
                 patterns.append({"name": row[0], "pattern": row[1], "category": row[2],
                                  "source": row[3], "hits": row[4], "created_at": row[5]})
+
+            totp_items = []
+            for row in conn.execute("SELECT name, secret, issuer, digits, period, algorithm, created_at FROM totp_secrets").fetchall():
+                try:
+                    plain = self._decrypt(row[1])
+                    totp_items.append({"name": row[0], "secret": plain, "issuer": row[2],
+                                       "digits": row[3], "period": row[4], "algorithm": row[5],
+                                       "created_at": row[6]})
+                except VaultError:
+                    continue
         finally:
             conn.close()
 
@@ -350,6 +377,7 @@ class Vault:
             "secrets": secrets,
             "protected": protected_items,
             "learned_patterns": patterns,
+            "totp_secrets": totp_items,
         }, ensure_ascii=False)
 
         # Encrypt with openssl using the provided password
@@ -421,6 +449,16 @@ class Vault:
                 result["imported"] += 1
             except Exception as e:
                 result["errors"].append(f"pattern {lp['name']}: {e}")
+
+        # Import TOTP secrets
+        for t in payload.get("totp_secrets", []):
+            try:
+                self.totp_add(t["name"], t["secret"], t.get("issuer", ""),
+                              t.get("digits", 6), t.get("period", 30),
+                              t.get("algorithm", "sha1"))
+                result["imported"] += 1
+            except Exception as e:
+                result["errors"].append(f"totp {t['name']}: {e}")
 
         self._invalidate_subs_cache()
         log.info("Vault import: %d imported, %d skipped, %d errors",
@@ -539,6 +577,19 @@ class Vault:
             raise VaultError(f"openssl decrypt failed: {proc.stderr.decode().strip()}")
         return proc.stdout.decode().strip()
 
+    # ── TOTP (RFC 6238) ─────────────────────────────────────────────────
+
+    def _generate_totp(self, secret_b32: str, digits: int = 6, period: int = 30, algorithm: str = "sha1") -> str:
+        """Generate TOTP code (RFC 6238) — pure stdlib."""
+        key = base64.b32decode(secret_b32.upper().replace(" ", "").replace("-", ""), casefold=True)
+        counter = int(time.time()) // period
+        counter_bytes = struct.pack(">Q", counter)
+        hash_algo = getattr(hashlib, algorithm, hashlib.sha1)
+        mac = hmac.new(key, counter_bytes, hash_algo).digest()
+        offset = mac[-1] & 0x0F
+        code_int = struct.unpack(">I", mac[offset:offset + 4])[0] & 0x7FFFFFFF
+        return str(code_int % (10 ** digits)).zfill(digits)
+
     # ── Database ─────────────────────────────────────────────────────────
 
     def _init_db(self):
@@ -585,6 +636,17 @@ class Vault:
                 master_hash  TEXT,
                 master_salt  TEXT,
                 auto_unlock_key TEXT
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS totp_secrets (
+                name       TEXT PRIMARY KEY,
+                secret     TEXT NOT NULL,
+                issuer     TEXT DEFAULT '',
+                digits     INTEGER DEFAULT 6,
+                period     INTEGER DEFAULT 30,
+                algorithm  TEXT DEFAULT 'sha1',
+                created_at TEXT DEFAULT (datetime('now'))
             )"""
         )
         # Migrate: add auto_unlock_key column if missing (existing DBs)
@@ -898,6 +960,28 @@ class Vault:
         finally:
             conn.close()
 
+    def remove_duplicate_protected(self, secret_value: str):
+        """Remove protected entries whose decrypted value matches secret_value.
+        Called after vault__store to clean auto_protect duplicates."""
+        conn = self._connect()
+        try:
+            rows = conn.execute("SELECT name, value FROM protected").fetchall()
+            removed = 0
+            for pname, encrypted_val in rows:
+                try:
+                    real_val = self._decrypt(encrypted_val)
+                    if real_val == secret_value:
+                        conn.execute("DELETE FROM protected WHERE name = ?", (pname,))
+                        log.info("Vault dedup: removed protected '%s' (duplicate of stored secret)", pname)
+                        removed += 1
+                except Exception:
+                    continue
+            if removed:
+                conn.commit()
+                self._invalidate_subs_cache()
+        finally:
+            conn.close()
+
     # ── Substitution cache ─────────────────────────────────────────────────
 
     _subs_cache: list | None = None
@@ -917,23 +1001,26 @@ class Vault:
         conn = self._connect()
         try:
             pairs = []
-            # Protected table
-            rows = conn.execute("SELECT value, alias FROM protected").fetchall()
-            for encrypted_val, alias in rows:
-                try:
-                    real_val = self._decrypt(encrypted_val)
-                    if real_val:
-                        pairs.append((real_val, alias))
-                except Exception:
-                    continue
-            # Secrets table (backward compat — auto-alias)
+            seen_values = set()
+            # Secrets first (priority over auto-protected)
             rows2 = conn.execute("SELECT name, value FROM secrets").fetchall()
             for name, encrypted_val in rows2:
                 try:
                     real_val = self._decrypt(encrypted_val)
                     alias = f"__vault_{name}__"
-                    if real_val:
+                    if real_val and real_val not in seen_values:
                         pairs.append((real_val, alias))
+                        seen_values.add(real_val)
+                except Exception:
+                    continue
+            # Protected table (skip values already covered by secrets)
+            rows = conn.execute("SELECT value, alias FROM protected").fetchall()
+            for encrypted_val, alias in rows:
+                try:
+                    real_val = self._decrypt(encrypted_val)
+                    if real_val and real_val not in seen_values:
+                        pairs.append((real_val, alias))
+                        seen_values.add(real_val)
                 except Exception:
                     continue
             # Sort by length descending to avoid partial replacements
@@ -1214,13 +1301,18 @@ class Vault:
                 self.increment_pattern_hits(name)
         return found
 
-    def auto_protect(self, text: str) -> tuple[str, list[str]]:
-        """Detect + auto-protect. Returns (masked_text, protected_names)."""
+    def auto_protect(self, text: str) -> tuple[str, list[str], list[dict]]:
+        """Detect + auto-protect. Returns (masked_text, protected_names, totp_hints).
+        TOTP secrets are NOT masked — the LLM needs raw values for vault__totp_add."""
         detected = self.auto_detect(text)
         if not detected:
-            return text, []
+            return text, [], []
         names = []
+        totp_hints = []
         for d in detected:
+            if d.category == "totp":
+                totp_hints.append({"value": d.value, "pattern": d.pattern_name})
+                continue  # do NOT mask TOTP secrets
             # Build name: type_prefix + context keywords
             # e.g. "email_ionos", "password_smtp_ovh", "phone_whatsapp"
             # Simplify pattern_name to short type prefix
@@ -1255,7 +1347,7 @@ class Vault:
             kind = "pii" if d.category == "pii" else "secret"
             self.protect(name, d.value, kind=kind, category=d.category)
             names.append(name)
-        return self.mask(text), names
+        return self.mask(text) if names else text, names, totp_hints
 
     def _name_exists_any(self, name: str) -> bool:
         """Check if name exists in secrets or protected tables."""
@@ -1326,6 +1418,163 @@ class Vault:
         finally:
             conn.close()
 
+    # ── TOTP CRUD ─────────────────────────────────────────────────────────
+
+    def totp_add(self, name: str, secret_b32: str, issuer: str = "",
+                 digits: int = 6, period: int = 30, algorithm: str = "sha1") -> bool:
+        """Store a TOTP secret (encrypted). Returns True if new, False if updated."""
+        try:
+            base64.b32decode(secret_b32.upper().replace(" ", "").replace("-", ""), casefold=True)
+        except Exception:
+            raise ValueError("Invalid base32 secret")
+        if digits not in (6, 8):
+            raise ValueError("digits must be 6 or 8")
+        if algorithm not in ("sha1", "sha256", "sha512"):
+            raise ValueError("algorithm must be sha1, sha256, or sha512")
+        enc_secret = self._encrypt(secret_b32)
+        conn = self._connect()
+        try:
+            cur = conn.execute("SELECT 1 FROM totp_secrets WHERE name = ?", (name,))
+            exists = cur.fetchone() is not None
+            conn.execute(
+                """INSERT OR REPLACE INTO totp_secrets (name, secret, issuer, digits, period, algorithm)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (name, enc_secret, issuer, digits, period, algorithm),
+            )
+            conn.commit()
+            return not exists
+        finally:
+            conn.close()
+
+    def totp_get_code(self, name: str) -> dict | None:
+        """Generate current TOTP code. Returns {code, remaining, period} or None.
+        Supports fuzzy match: if exact name not found, tries LIKE on name+issuer.
+        Returns {"error":"ambiguous","matches":[...]} if multiple fuzzy matches."""
+        if self.is_locked():
+            raise VaultError("Vault is locked — unlock first")
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT secret, digits, period, algorithm FROM totp_secrets WHERE name = ?",
+                (name,),
+            ).fetchone()
+            if not row:
+                # Fuzzy fallback: LIKE on name and issuer
+                pattern = f"%{name}%"
+                rows = conn.execute(
+                    "SELECT name, secret, digits, period, algorithm FROM totp_secrets WHERE name LIKE ? OR issuer LIKE ?",
+                    (pattern, pattern),
+                ).fetchall()
+                if not rows:
+                    return None
+                if len(rows) > 1:
+                    return {"error": "ambiguous", "matches": [r[0] for r in rows]}
+                row = rows[0][1:]  # skip name column
+        finally:
+            conn.close()
+        secret_b32 = self._decrypt(row[0])
+        code = self._generate_totp(secret_b32, digits=row[1], period=row[2], algorithm=row[3])
+        remaining = row[2] - (int(time.time()) % row[2])
+        return {"code": code, "remaining": remaining, "period": row[2]}
+
+    def totp_list(self) -> list[dict]:
+        """List all TOTP entries (without secrets)."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT name, issuer, digits, period, algorithm, created_at FROM totp_secrets ORDER BY name"
+            ).fetchall()
+        finally:
+            conn.close()
+        return [{"name": r[0], "issuer": r[1], "digits": r[2], "period": r[3],
+                 "algorithm": r[4], "created_at": r[5]} for r in rows]
+
+    def totp_delete(self, name: str) -> bool:
+        """Delete a TOTP entry. Returns True if existed."""
+        conn = self._connect()
+        try:
+            cur = conn.execute("DELETE FROM totp_secrets WHERE name = ?", (name,))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    def totp_verify(self, name: str, code: str) -> bool:
+        """Verify a TOTP code (allows +/-1 time step for clock drift)."""
+        if self.is_locked():
+            raise VaultError("Vault is locked — unlock first")
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT secret, digits, period, algorithm FROM totp_secrets WHERE name = ?",
+                (name,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return False
+        secret_b32 = self._decrypt(row[0])
+        current_time = int(time.time())
+        key = base64.b32decode(secret_b32.upper().replace(" ", "").replace("-", ""), casefold=True)
+        hash_algo = getattr(hashlib, row[3], hashlib.sha1)
+        for offset in (-1, 0, 1):
+            counter = (current_time + offset * row[2]) // row[2]
+            counter_bytes = struct.pack(">Q", counter)
+            mac = hmac.new(key, counter_bytes, hash_algo).digest()
+            off = mac[-1] & 0x0F
+            code_int = struct.unpack(">I", mac[off:off + 4])[0] & 0x7FFFFFFF
+            expected = str(code_int % (10 ** row[1])).zfill(row[1])
+            if hmac.compare_digest(code, expected):
+                return True
+        return False
+
+    def totp_rename(self, old_name: str, new_name: str) -> bool:
+        """Rename a TOTP entry. Returns True if renamed, False if not found."""
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT 1 FROM totp_secrets WHERE name = ?", (old_name,)).fetchone()
+            if not row:
+                return False
+            conn.execute("UPDATE totp_secrets SET name = ? WHERE name = ?", (new_name, old_name))
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+    def totp_parse_uri(self, uri: str) -> dict:
+        """Parse otpauth://totp/ URI into components."""
+        from urllib.parse import urlparse, parse_qs, unquote
+        parsed = urlparse(uri)
+        if parsed.scheme != "otpauth" or parsed.netloc != "totp":
+            raise ValueError("Invalid TOTP URI (expected otpauth://totp/...)")
+        label = unquote(parsed.path.lstrip("/"))
+        params = parse_qs(parsed.query)
+        secret = params.get("secret", [None])[0]
+        if not secret:
+            raise ValueError("Missing secret in TOTP URI")
+        issuer = params.get("issuer", [""])[0]
+        if ":" in label:
+            label_issuer, label = label.split(":", 1)
+            if not issuer:
+                issuer = label_issuer
+        name = label.strip() or issuer.strip() or "totp"
+        return {
+            "name": name,
+            "secret": secret,
+            "issuer": issuer,
+            "digits": int(params.get("digits", [6])[0]),
+            "period": int(params.get("period", [30])[0]),
+            "algorithm": params.get("algorithm", ["sha1"])[0].lower(),
+        }
+
+    def totp_add_from_uri(self, uri: str, name_override: str = "") -> tuple[str, bool]:
+        """Parse otpauth URI and store. Returns (name, is_new)."""
+        parsed = self.totp_parse_uri(uri)
+        name = name_override or parsed["name"]
+        is_new = self.totp_add(name, parsed["secret"], parsed["issuer"],
+                               parsed["digits"], parsed["period"], parsed["algorithm"])
+        return name, is_new
+
 
 # ── Auto-detect patterns (module-level, compiled once) ─────────────────────
 
@@ -1394,6 +1643,9 @@ AUTO_DETECT_PATTERNS = [
     # ── CONTACT PII (keyword context) ──
     (r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b', 'email_address', 'pii'),
     (r'(?:tel|phone|mobile|portable|numero|whatsapp)[\s:=]+\+?[0-9][\s.-]?(?:[0-9][\s.-]?){7,14}', 'phone_number', 'pii'),
+    # ── TOTP (must NOT be masked — LLM needs raw value for vault__totp_add) ──
+    (r'otpauth://totp/[^\s]+', 'totp_uri', 'totp'),
+    (r'(?:totp|2fa|authenticator|otp)(?:\s+\w+){0,3}\s*[:=]?\s*([A-Z2-7]{16,}={0,6})', 'totp_base32', 'totp'),
 ]
 
 _auto_compiled = [(re.compile(p, re.IGNORECASE), n, c) for p, n, c in AUTO_DETECT_PATTERNS]

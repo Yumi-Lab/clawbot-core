@@ -89,6 +89,8 @@ class WebChannel(ChannelBase):
 
         except BrokenPipeError:
             log.info("Client disconnected, continuing in background (session=%s)", session_id)
+            from orchestrator import mark_draining
+            mark_draining(session_id)  # prevent new injects during background drain
             self._drain_in_background(gen, session_id, final_content, save_fn)
             return
 

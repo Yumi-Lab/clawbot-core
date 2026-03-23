@@ -1,8 +1,313 @@
 {
   "id": "whatsapp-bridge",
   "name": "WhatsApp Bridge",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "port": 3100,
   "service": "whatsapp-bridge",
-  "tool_definitions": []
+  "tool_definitions": [
+    {
+      "name": "get_status",
+      "description": "Check WhatsApp bridge connection status. Returns connected state, phone number, QR code if pending.",
+      "parameters": { "type": "object", "properties": {}, "required": [] }
+    },
+    {
+      "name": "send_message",
+      "description": "Send a text message via WhatsApp.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "to": { "type": "string", "description": "Phone number E.164 (e.g. +33612345678) or group JID" },
+          "text": { "type": "string", "description": "Message text" },
+          "quote_message_id": { "type": "string", "description": "Optional: message ID to reply/quote" }
+        },
+        "required": ["to", "text"]
+      }
+    },
+    {
+      "name": "send_image",
+      "description": "Send an image via WhatsApp from a local file path.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "to": { "type": "string", "description": "Phone E.164 or group JID" },
+          "image_path": { "type": "string", "description": "Absolute path to image (jpg, png, gif, webp)" },
+          "caption": { "type": "string", "description": "Optional caption" }
+        },
+        "required": ["to", "image_path"]
+      }
+    },
+    {
+      "name": "send_video",
+      "description": "Send a video via WhatsApp from a local file path.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "to": { "type": "string", "description": "Phone E.164 or group JID" },
+          "video_path": { "type": "string", "description": "Absolute path to video (mp4, 3gp)" },
+          "caption": { "type": "string", "description": "Optional caption" }
+        },
+        "required": ["to", "video_path"]
+      }
+    },
+    {
+      "name": "send_audio",
+      "description": "Send a voice message (PTT) via WhatsApp. Must be OGG/Opus.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "to": { "type": "string", "description": "Phone E.164 or group JID" },
+          "audio_path": { "type": "string", "description": "Absolute path to .ogg opus file" }
+        },
+        "required": ["to", "audio_path"]
+      }
+    },
+    {
+      "name": "send_file",
+      "description": "Send a document/file via WhatsApp (PDF, ZIP, TXT, etc.).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "to": { "type": "string", "description": "Phone E.164 or group JID" },
+          "file_path": { "type": "string", "description": "Absolute path to the file" },
+          "filename": { "type": "string", "description": "Display filename (auto-detected if omitted)" }
+        },
+        "required": ["to", "file_path"]
+      }
+    },
+    {
+      "name": "send_location",
+      "description": "Send a location pin via WhatsApp.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "to": { "type": "string", "description": "Phone E.164 or group JID" },
+          "latitude": { "type": "number", "description": "Latitude (e.g. 48.8566)" },
+          "longitude": { "type": "number", "description": "Longitude (e.g. 2.3522)" },
+          "name": { "type": "string", "description": "Location name (e.g. 'Tour Eiffel')" },
+          "address": { "type": "string", "description": "Address text" }
+        },
+        "required": ["to", "latitude", "longitude"]
+      }
+    },
+    {
+      "name": "send_contact",
+      "description": "Send a contact card (vCard) via WhatsApp.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "to": { "type": "string", "description": "Phone E.164 or group JID" },
+          "contact_name": { "type": "string", "description": "Full name of the contact" },
+          "contact_phone": { "type": "string", "description": "Phone number of the contact" }
+        },
+        "required": ["to", "contact_name", "contact_phone"]
+      }
+    },
+    {
+      "name": "react_to_message",
+      "description": "React to a message with an emoji (like, heart, etc.). Use empty emoji to remove reaction.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "jid": { "type": "string", "description": "Chat JID where the message is" },
+          "message_id": { "type": "string", "description": "ID of the message to react to" },
+          "emoji": { "type": "string", "description": "Emoji reaction (e.g. '👍', '❤️', '😂'). Empty string to remove." }
+        },
+        "required": ["jid", "message_id", "emoji"]
+      }
+    },
+    {
+      "name": "edit_message",
+      "description": "Edit a previously sent message (only own messages, within 15 min).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "jid": { "type": "string", "description": "Chat JID" },
+          "message_id": { "type": "string", "description": "ID of the message to edit" },
+          "new_text": { "type": "string", "description": "New text content" }
+        },
+        "required": ["jid", "message_id", "new_text"]
+      }
+    },
+    {
+      "name": "delete_message",
+      "description": "Delete a message for everyone in the chat (only own messages, within ~2 days).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "jid": { "type": "string", "description": "Chat JID" },
+          "message_id": { "type": "string", "description": "ID of the message to delete" }
+        },
+        "required": ["jid", "message_id"]
+      }
+    },
+    {
+      "name": "pin_message",
+      "description": "Pin or unpin a message in a chat.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "jid": { "type": "string", "description": "Chat JID" },
+          "message_id": { "type": "string", "description": "ID of the message" },
+          "pin": { "type": "boolean", "description": "true to pin, false to unpin" }
+        },
+        "required": ["jid", "message_id", "pin"]
+      }
+    },
+    {
+      "name": "pin_chat",
+      "description": "Pin or unpin a conversation to the top of the chat list.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "jid": { "type": "string", "description": "Chat JID (phone@s.whatsapp.net or group@g.us)" },
+          "pin": { "type": "boolean", "description": "true to pin, false to unpin" }
+        },
+        "required": ["jid", "pin"]
+      }
+    },
+    {
+      "name": "archive_chat",
+      "description": "Archive or unarchive a conversation.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "jid": { "type": "string", "description": "Chat JID" },
+          "archive": { "type": "boolean", "description": "true to archive, false to unarchive" }
+        },
+        "required": ["jid", "archive"]
+      }
+    },
+    {
+      "name": "mute_chat",
+      "description": "Mute or unmute a conversation.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "jid": { "type": "string", "description": "Chat JID" },
+          "mute": { "type": "boolean", "description": "true to mute, false to unmute" },
+          "duration": { "type": "string", "description": "Mute duration: '8h', '1w', or 'forever' (default: forever)" }
+        },
+        "required": ["jid", "mute"]
+      }
+    },
+    {
+      "name": "mark_read",
+      "description": "Mark a conversation as read or unread.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "jid": { "type": "string", "description": "Chat JID" },
+          "read": { "type": "boolean", "description": "true = read, false = unread" }
+        },
+        "required": ["jid", "read"]
+      }
+    },
+    {
+      "name": "delete_chat",
+      "description": "Delete an entire conversation (irreversible).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "jid": { "type": "string", "description": "Chat JID" }
+        },
+        "required": ["jid"]
+      }
+    },
+    {
+      "name": "create_group",
+      "description": "Create a new WhatsApp group with specified participants.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "Group name" },
+          "participants": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Array of phone numbers E.164 to add as members"
+          }
+        },
+        "required": ["name", "participants"]
+      }
+    },
+    {
+      "name": "group_info",
+      "description": "Get full information about a WhatsApp group: name, description, members, admins, settings.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "jid": { "type": "string", "description": "Group JID (e.g. 120363xxxx@g.us)" }
+        },
+        "required": ["jid"]
+      }
+    },
+    {
+      "name": "group_update",
+      "description": "Update group settings: name, description, or admin-only mode.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "jid": { "type": "string", "description": "Group JID" },
+          "subject": { "type": "string", "description": "New group name" },
+          "description": { "type": "string", "description": "New group description" },
+          "setting": { "type": "string", "description": "'announcement' (admin-only) | 'not_announcement' (everyone) | 'locked' | 'unlocked'" }
+        },
+        "required": ["jid"]
+      }
+    },
+    {
+      "name": "group_manage_members",
+      "description": "Add, remove, promote to admin, or demote members in a group.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "jid": { "type": "string", "description": "Group JID" },
+          "participants": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Phone numbers E.164 of members to manage"
+          },
+          "action": { "type": "string", "description": "'add' | 'remove' | 'promote' | 'demote'" }
+        },
+        "required": ["jid", "participants", "action"]
+      }
+    },
+    {
+      "name": "check_whatsapp",
+      "description": "Check if phone numbers have WhatsApp accounts.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "phones": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Array of phone numbers E.164 to check"
+          }
+        },
+        "required": ["phones"]
+      }
+    },
+    {
+      "name": "get_profile_info",
+      "description": "Get profile picture URL, status text, and business info for a contact.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "jid": { "type": "string", "description": "Contact JID or phone@s.whatsapp.net" }
+        },
+        "required": ["jid"]
+      }
+    },
+    {
+      "name": "list_recent_media",
+      "description": "List recently received WhatsApp media files (images, audio, video, documents).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "limit": { "type": "number", "description": "Max files to return (default 20)" },
+          "type_filter": { "type": "string", "description": "Filter by type: 'image', 'audio', 'video', 'file', or 'all' (default)" }
+        },
+        "required": []
+      }
+    }
+  ]
 }
