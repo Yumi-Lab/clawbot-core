@@ -29,7 +29,19 @@ import fs from 'fs';
 import path from 'path';
 import http from 'http';
 import { fileURLToPath } from 'url';
+import dns from 'dns';
+import net from 'net';
 import pino from 'pino';
+
+// Force IPv4 globally — IPv6 bypasses VPN tunnel and gets blocked by GFW in China
+dns.setDefaultResultOrder('ipv4first');
+const _origLookup = dns.lookup;
+dns.lookup = function(hostname, options, callback) {
+  if (typeof options === 'function') { callback = options; options = {}; }
+  if (typeof options === 'number') options = { family: options };
+  options = { ...options, family: 4 };
+  return _origLookup.call(dns, hostname, options, callback);
+};
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -59,7 +71,27 @@ let lastQr = null;           // data:image/png;base64,...
 let connStatus = 'disconnected'; // 'disconnected' | 'qr_pending' | 'connected' | 'error'
 let phoneNumber = null;      // '+33612345678'
 let reconnectCount = 0;
+let consecutive408 = 0;          // track consecutive 408 timeouts
+let authClearCount = 0;          // track how many times we've cleared auth due to 408
+let lastError = null;            // last disconnect error details for dashboard
+let bridgeLogs = [];             // rolling log buffer for dashboard
+const MAX_LOG_LINES = 200;
 const _sentByBridge = new Set(); // message IDs sent by us (to avoid loops)
+
+// ── Structured logging ──────────────────────────────────────────────────────
+const _origLog = console.log;
+const _origErr = console.error;
+const _origWarn = console.warn;
+
+function _pushLog(level, args) {
+  const line = { ts: Date.now(), level, msg: args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ') };
+  bridgeLogs.push(line);
+  if (bridgeLogs.length > MAX_LOG_LINES) bridgeLogs.shift();
+}
+
+console.log = (...args) => { _pushLog('info', args); _origLog(...args); };
+console.error = (...args) => { _pushLog('error', args); _origErr(...args); };
+console.warn = (...args) => { _pushLog('warn', args); _origWarn(...args); };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -100,6 +132,20 @@ function _buildVCard(name, phone) {
 
 // ── Baileys socket ─────────────────────────────────────────────────────────────
 async function createWASocket() {
+  // Check for stale credentials before connecting
+  const credsPath = path.join(AUTH_DIR, 'creds.json');
+  if (fs.existsSync(credsPath)) {
+    try {
+      const creds = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
+      if (creds.registered === false) {
+        console.log('[bridge] Stale creds (registered=false), clearing auth');
+        _clearAuth();
+      }
+    } catch (e) {
+      console.warn('[bridge] Could not read creds.json:', e.message);
+    }
+  }
+
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const logger = pino({ level: 'silent' });
   const { version } = await fetchLatestWaWebVersion({});
@@ -132,7 +178,10 @@ async function createWASocket() {
     if (connection === 'open') {
       connStatus = 'connected';
       lastQr = null;
+      lastError = null;
       reconnectCount = 0;
+      consecutive408 = 0;
+      authClearCount = 0;
       // JID format: "33612345678:16@s.whatsapp.net" → "+33612345678"
       const jid = sock.user ? sock.user.id : '';
       const num = jid.split(':')[0].split('@')[0].replace(/[^0-9]/g, '');
@@ -144,23 +193,65 @@ async function createWASocket() {
       const code = lastDisconnect && lastDisconnect.error && lastDisconnect.error.output
         ? lastDisconnect.error.output.statusCode
         : 0;
-      console.log('[bridge] Connection closed — code:', code);
+      const errMsg = lastDisconnect?.error?.message || 'unknown';
+      console.log('[bridge] Connection closed — code:', code, 'reason:', errMsg);
 
       if (code === DisconnectReason.loggedOut) {
         console.log('[bridge] Logged out — clearing session');
         connStatus = 'disconnected';
+        lastError = { code, reason: 'logged_out', message: 'WhatsApp session revoked — scan QR to reconnect', ts: Date.now() };
         phoneNumber = null;
         lastQr = null;
         reconnectCount = 0;
+        consecutive408 = 0;
+        authClearCount = 0;
         _clearAuth();
         setTimeout(createWASocket, RECONNECT_DELAY_MS);
+      } else if (code === 408) {
+        // Timeout — track consecutive 408s
+        consecutive408++;
+        lastError = { code: 408, reason: 'timeout', message: `Connection timeout (${consecutive408}/3)`, ts: Date.now() };
+        console.warn(`[bridge] 408 timeout (${consecutive408}/3)`);
+        if (consecutive408 >= 3) {
+          authClearCount++;
+          if (authClearCount > 3) {
+            connStatus = 'error';
+            lastError = { code: 408, reason: 'auth_clear_limit', message: 'Too many auth clears — stopping, systemd will restart', ts: Date.now() };
+            console.error('[bridge] Auth cleared 3+ times with no recovery — exiting for systemd restart');
+            setTimeout(() => process.exit(1), 1000);
+          } else {
+            const backoffMs = authClearCount * 60000; // 60s, 120s, 180s
+            console.log(`[bridge] 3x 408 — session likely expired, clearing auth for fresh QR (attempt ${authClearCount}/3, backoff ${backoffMs/1000}s)`);
+            lastError = { code: 408, reason: 'session_expired', message: `Session expired after 3 consecutive timeouts — clearing auth (${authClearCount}/3)`, ts: Date.now() };
+            connStatus = 'disconnected';
+            phoneNumber = null;
+            lastQr = null;
+            _clearAuth();
+            consecutive408 = 0;
+            reconnectCount = 0;
+            setTimeout(createWASocket, backoffMs);
+          }
+        } else if (reconnectCount < MAX_RECONNECTS) {
+          reconnectCount++;
+          connStatus = 'reconnecting';
+          setTimeout(createWASocket, RECONNECT_DELAY_MS);
+        } else {
+          connStatus = 'error';
+          lastError = { code, reason: 'max_retries', message: `Max reconnects (${MAX_RECONNECTS}) reached after 408 timeouts`, ts: Date.now() };
+          console.error('[bridge] Max reconnects reached — exiting for systemd restart');
+          setTimeout(() => process.exit(1), 1000);
+        }
       } else if (reconnectCount < MAX_RECONNECTS) {
+        consecutive408 = 0; // reset on non-408 disconnect
         reconnectCount++;
-        connStatus = 'disconnected';
+        connStatus = 'reconnecting';
+        lastError = { code, reason: 'disconnected', message: `Disconnected (code ${code}) — retry ${reconnectCount}/${MAX_RECONNECTS}`, ts: Date.now() };
         console.log(`[bridge] Reconnecting (${reconnectCount}/${MAX_RECONNECTS})...`);
         setTimeout(createWASocket, RECONNECT_DELAY_MS);
       } else {
+        consecutive408 = 0;
         connStatus = 'error';
+        lastError = { code, reason: 'max_retries', message: `Max reconnects (${MAX_RECONNECTS}) reached — code ${code}`, ts: Date.now() };
         console.error('[bridge] Max reconnects reached — exiting for systemd restart');
         setTimeout(() => process.exit(1), 1000);
       }
@@ -339,7 +430,37 @@ app.get('/status', (_req, res) => {
     status: connStatus,
     phone: phoneNumber,
     qr: connStatus === 'qr_pending' ? lastQr : null,
+    error: lastError,
+    reconnectCount,
+    consecutive408,
   });
+});
+
+// Force logout — clear auth + restart socket (callable from dashboard/API)
+app.post('/logout', async (_req, res) => {
+  console.log('[bridge] Manual logout requested');
+  connStatus = 'disconnected';
+  phoneNumber = null;
+  lastQr = null;
+  lastError = null;
+  reconnectCount = 0;
+  consecutive408 = 0;
+  // Close current socket gracefully
+  if (sock) {
+    try { sock.end(undefined); } catch {}
+    sock = null;
+  }
+  _clearAuth();
+  // Restart with fresh socket after a short delay
+  setTimeout(createWASocket, 2000);
+  res.json({ ok: true, message: 'Session cleared — fresh QR will appear shortly' });
+});
+
+// Bridge logs — rolling buffer for dashboard
+app.get('/logs', (_req, res) => {
+  const since = parseInt(_req.query.since) || 0;
+  const filtered = since ? bridgeLogs.filter(l => l.ts > since) : bridgeLogs;
+  res.json({ ok: true, logs: filtered });
 });
 
 app.post('/send', async (req, res) => {
@@ -763,7 +884,7 @@ app.post('/v1/whatsapp-bridge/:toolName/execute', async (req, res) => {
 async function _executeTool(name, args) {
   switch (name) {
     case 'get_status':
-      return { connected: connStatus === 'connected', status: connStatus, phone: phoneNumber };
+      return { connected: connStatus === 'connected', status: connStatus, phone: phoneNumber, error: lastError, reconnectCount, consecutive408 };
 
     case 'send_message': {
       const jid = _resolveJid(args.to);
